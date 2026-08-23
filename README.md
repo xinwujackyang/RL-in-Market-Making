@@ -34,6 +34,7 @@ python experiments/replication_study.py       # five seeds by default
 python experiments/analytical_response.py    # stochastic-policy best response
 python experiments/risk_aversion.py           # paired three-seed comparison
 python experiments/investor_flow_investigation.py  # Gamma vs paper unit flow
+python experiments/paper_aligned_ppo.py             # unit-flow current vs paper PPO clip
 ```
 
 The investor-flow investigation keeps the current PPO fixed and compares the
@@ -41,6 +42,13 @@ default 20 Gamma-size orders with 20 paper-style unit orders under paired random
 competitor seeds. Its Chinese report and latent-standard-deviation trajectory are
 under `results/investor_flow/`. Run `--phase paper-ppo` only if the flow-only
 comparison warrants the conditional full-paper configuration.
+
+The paper-aligned PPO experiment reads the current defaults directly: both
+conditions use learning rate `5e-5`, a two-layer 256-wide tanh network, and
+minibatches of 256. The controlled comparison changes only PPO clip from `0.2`
+to the paper-reported `0.3`, records deterministic mean-policy and latent-sigma
+trajectories every rollout, and writes its five-seed report under
+`results/paper_aligned_ppo/`.
 
 ### Analytical best response
 

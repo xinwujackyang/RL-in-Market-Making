@@ -146,6 +146,10 @@ class PPOAgent:
         log_std_gradient_vectors = []
         actor_mean_gradients = []
         entropies = []
+        policy_losses = []
+        value_losses = []
+        approx_kls = []
+        clip_fractions = []
         for _ in range(self.cfg.n_epochs):
             indices = np.random.permutation(self.cfg.horizon)
             for start in range(0, self.cfg.horizon, self.cfg.minibatch_size):
@@ -158,6 +162,13 @@ class PPOAgent:
                 policy_loss = -torch.min(objective, clipped).mean()
                 value_loss = (returns[batch] - values).square().mean()
                 entropy = distribution.entropy().sum(-1).mean()
+                with torch.no_grad():
+                    approx_kls.append((old_log_probs[batch] - log_probs).mean().item())
+                    clip_fractions.append(
+                        ((ratio - 1.0).abs() > self.cfg.clip_eps).float().mean().item()
+                    )
+                policy_losses.append(policy_loss.detach().item())
+                value_losses.append(value_loss.detach().item())
                 loss = policy_loss + self.cfg.vf_coef * value_loss - self.cfg.ent_coef * entropy
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -190,6 +201,10 @@ class PPOAgent:
             "latent_std_ask": float(latent_std[1]),
             "latent_std_hedge": float(latent_std[2]),
             "entropy_proxy": float(np.mean(entropies)),
+            "policy_loss": float(np.mean(policy_losses)),
+            "value_loss": float(np.mean(value_losses)),
+            "approx_kl": float(np.mean(approx_kls)),
+            "clip_fraction": float(np.mean(clip_fractions)),
             "mean_abs_grad_log_std": float(np.mean(log_std_gradients)),
             "mean_grad_log_std_bid": float(mean_log_std_gradient[0]),
             "mean_grad_log_std_ask": float(mean_log_std_gradient[1]),
