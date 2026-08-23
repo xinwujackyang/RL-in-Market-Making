@@ -44,6 +44,7 @@ class Config:
     hidden_size: int = 256
     hidden_layers: int = 2
     fixed_policy_std: float | None = None
+    state_dependent_std: bool = False
 
     # Experiment
     seed: int = 42

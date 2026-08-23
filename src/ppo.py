@@ -96,9 +96,15 @@ class PPOAgent:
         seed_everything(self.cfg.seed)
         observation_dim = env.reset().shape[0]
         self.network = ActorCritic(
-            observation_dim, 3, self.cfg.hidden_size, self.cfg.hidden_layers
+            observation_dim,
+            3,
+            self.cfg.hidden_size,
+            self.cfg.hidden_layers,
+            state_dependent_std=self.cfg.state_dependent_std,
         ).to(self.cfg.device)
         if self.cfg.fixed_policy_std is not None:
+            if self.cfg.state_dependent_std:
+                raise ValueError("fixed_policy_std requires global policy std")
             if self.cfg.fixed_policy_std <= 0:
                 raise ValueError("fixed_policy_std must be positive")
             with torch.no_grad():
@@ -123,6 +129,12 @@ class PPOAgent:
 
     def sample_action(self, observation: np.ndarray) -> np.ndarray:
         return self.select_action(observation)[0]
+
+    @torch.no_grad()
+    def latent_std(self, observation: np.ndarray) -> np.ndarray:
+        obs = torch.as_tensor(observation, dtype=torch.float32, device=self.cfg.device)
+        _, log_std = self.network.latent_policy_parameters(obs)
+        return log_std.exp().cpu().numpy()
 
     @torch.no_grad()
     def policy_entropy(self, observation: np.ndarray) -> float:
@@ -178,8 +190,13 @@ class PPOAgent:
         old_means = old_log_std = None
         if self.cfg.kl_coef > 0.0:
             with torch.no_grad():
-                old_means, _ = self.network.latent_mean_and_value(observations)
-                old_log_std = self.network.log_std.detach().clone()
+                old_means, old_log_std = self.network.latent_policy_parameters(observations)
+                old_means = old_means.detach()
+                old_log_std = old_log_std.detach()
+        if self.network.policy_log_std is not None:
+            std_parameters = list(self.network.policy_log_std.parameters())
+        else:
+            std_parameters = [self.network.log_std]
         log_std_gradients = []
         log_std_gradient_vectors = []
         actor_mean_gradients = []
@@ -217,9 +234,9 @@ class PPOAgent:
                 if old_means is not None and old_log_std is not None:
                     analytic_kl = diagonal_gaussian_kl(
                         old_means[batch],
-                        old_log_std,
+                        old_log_std[batch],
                         distribution.base.loc,
-                        self.network.log_std,
+                        distribution.base.scale.log(),
                     ).mean()
                 else:
                     analytic_kl = torch.zeros((), device=self.cfg.device)
@@ -241,11 +258,24 @@ class PPOAgent:
                 )
                 self.optimizer.zero_grad()
                 loss.backward()
-                if self.network.log_std.grad is not None:
-                    log_std_gradients.append(self.network.log_std.grad.detach().abs().mean().item())
-                    log_std_gradient_vectors.append(
-                        self.network.log_std.grad.detach().cpu().numpy().copy()
+                std_gradients = [
+                    parameter.grad for parameter in std_parameters if parameter.grad is not None
+                ]
+                if std_gradients:
+                    gradient_sum = sum(
+                        gradient.detach().abs().sum().item() for gradient in std_gradients
                     )
+                    gradient_count = sum(gradient.numel() for gradient in std_gradients)
+                    log_std_gradients.append(gradient_sum / gradient_count)
+                    if self.network.policy_log_std is not None:
+                        bias_gradient = self.network.policy_log_std.bias.grad
+                        log_std_gradient_vectors.append(
+                            bias_gradient.detach().cpu().numpy().copy()
+                        )
+                    else:
+                        log_std_gradient_vectors.append(
+                            self.network.log_std.grad.detach().cpu().numpy().copy()
+                        )
                 else:
                     log_std_gradients.append(0.0)
                     log_std_gradient_vectors.append(np.zeros(3, dtype=np.float32))
@@ -259,8 +289,10 @@ class PPOAgent:
                 entropies.append(entropy.detach().item())
                 nn.utils.clip_grad_norm_(self.network.parameters(), self.cfg.max_grad_norm)
                 self.optimizer.step()
-        log_std = self.network.log_std.detach().cpu().numpy()
-        latent_std = np.exp(log_std)
+        with torch.no_grad():
+            _, rollout_log_std = self.network.latent_policy_parameters(observations)
+            log_std = rollout_log_std.mean(dim=0).cpu().numpy()
+            latent_std = rollout_log_std.exp().mean(dim=0).cpu().numpy()
         mean_log_std_gradient = np.mean(log_std_gradient_vectors, axis=0)
         return {
             "log_std_bid": float(log_std[0]),
@@ -282,7 +314,9 @@ class PPOAgent:
             "mean_grad_log_std_ask": float(mean_log_std_gradient[1]),
             "mean_grad_log_std_hedge": float(mean_log_std_gradient[2]),
             "entropy_grad_log_std": float(
-                -self.cfg.ent_coef if self.network.log_std.requires_grad else 0.0
+                -self.cfg.ent_coef
+                if any(parameter.requires_grad for parameter in std_parameters)
+                else 0.0
             ),
             "mean_abs_grad_actor_mean": float(np.mean(actor_mean_gradients)),
             "grad_ratio_log_std_to_actor_mean": float(

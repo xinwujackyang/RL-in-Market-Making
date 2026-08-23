@@ -17,6 +17,11 @@ def evaluate_policy(
         total = competitor_total = 0.0
         for _ in range(steps):
             series["inventory_before_action"].append(float(observation[0]))
+            if hasattr(agent, "latent_std"):
+                latent_std = agent.latent_std(observation)
+                series["latent_std_bid"].append(float(latent_std[0]))
+                series["latent_std_ask"].append(float(latent_std[1]))
+                series["latent_std_hedge"].append(float(latent_std[2]))
             action = (
                 agent.deterministic_action(observation)
                 if deterministic
@@ -83,12 +88,14 @@ def evaluate_policy(
         ),
         "mean_policy_entropy_proxy": float(data["policy_entropy"].mean()),
     }
-    if hasattr(agent, "network"):
-        latent_std = agent.network.log_std.detach().exp().cpu().numpy()
+    if "latent_std_bid" in data:
         metrics.update(
-            latent_std_bid=float(latent_std[0]),
-            latent_std_ask=float(latent_std[1]),
-            latent_std_hedge=float(latent_std[2]),
+            latent_std_bid=float(data["latent_std_bid"].mean()),
+            latent_std_ask=float(data["latent_std_ask"].mean()),
+            latent_std_hedge=float(data["latent_std_hedge"].mean()),
+            latent_std_bid_state_std=float(data["latent_std_bid"].std()),
+            latent_std_ask_state_std=float(data["latent_std_ask"].std()),
+            latent_std_hedge_state_std=float(data["latent_std_hedge"].std()),
         )
     if episode_competitor_totals:
         metrics["mean_competitor_pnl"] = float(np.mean(episode_competitor_totals))
