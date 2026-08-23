@@ -186,6 +186,8 @@ class PPOAgent:
         entropies = []
         policy_losses = []
         value_losses = []
+        unclipped_value_losses = []
+        value_clip_fractions = []
         approx_kls = []
         analytic_kls = []
         clip_fractions = []
@@ -199,7 +201,18 @@ class PPOAgent:
                 objective = ratio * advantages[batch]
                 clipped = torch.clamp(ratio, 1 - self.cfg.clip_eps, 1 + self.cfg.clip_eps) * advantages[batch]
                 policy_loss = -torch.min(objective, clipped).mean()
-                value_loss = (returns[batch] - values).square().mean()
+                value_error_sq = (returns[batch] - values).square()
+                unclipped_value_loss = value_error_sq.mean()
+                if self.cfg.vf_clip_param is not None:
+                    value_loss = torch.clamp(
+                        value_error_sq, max=self.cfg.vf_clip_param
+                    ).mean()
+                    value_clip_fraction = (
+                        value_error_sq > self.cfg.vf_clip_param
+                    ).float().mean()
+                else:
+                    value_loss = unclipped_value_loss
+                    value_clip_fraction = torch.zeros((), device=self.cfg.device)
                 entropy = distribution.entropy().sum(-1).mean()
                 if old_means is not None and old_log_std is not None:
                     analytic_kl = diagonal_gaussian_kl(
@@ -217,6 +230,8 @@ class PPOAgent:
                     )
                 policy_losses.append(policy_loss.detach().item())
                 value_losses.append(value_loss.detach().item())
+                unclipped_value_losses.append(unclipped_value_loss.detach().item())
+                value_clip_fractions.append(value_clip_fraction.detach().item())
                 analytic_kls.append(analytic_kl.detach().item())
                 loss = (
                     policy_loss
@@ -257,6 +272,8 @@ class PPOAgent:
             "entropy_proxy": float(np.mean(entropies)),
             "policy_loss": float(np.mean(policy_losses)),
             "value_loss": float(np.mean(value_losses)),
+            "value_loss_unclipped": float(np.mean(unclipped_value_losses)),
+            "value_clip_fraction": float(np.mean(value_clip_fractions)),
             "approx_kl": float(np.mean(approx_kls)),
             "analytic_kl": float(np.mean(analytic_kls)),
             "clip_fraction": float(np.mean(clip_fractions)),

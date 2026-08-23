@@ -37,6 +37,7 @@ class Config:
     clip_eps: float = 0.2
     lr: float = 5e-5
     vf_coef: float = 0.5
+    vf_clip_param: float | None = None
     ent_coef: float = 3e-3
     kl_coef: float = 0.0
     max_grad_norm: float = 0.5
@@ -76,6 +77,8 @@ class Config:
             raise ValueError("Gamma order-size parameters must be positive")
         if self.kl_coef < 0.0:
             raise ValueError("kl_coef must be nonnegative")
+        if self.vf_clip_param is not None and self.vf_clip_param <= 0.0:
+            raise ValueError("vf_clip_param must be positive when set")
 
 
 def seed_everything(seed: int) -> None:
