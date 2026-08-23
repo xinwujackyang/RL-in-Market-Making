@@ -31,15 +31,25 @@ class SingleDealerMarketEnv:
         self.price = self.cfg.P0
         self.inventory = 0.0
         self.last_pnl = PnL()
+        self.prev_bid_fill_fraction = 0.0
+        self.prev_ask_fill_fraction = 0.0
         self.t = 0
         return self._observation()
 
     def _observation(self) -> np.ndarray:
         price_feature = self.price / self.cfg.P0 - 1.0 if self.cfg.relative_price else self.price
-        return np.array(
-            [self.inventory, price_feature, self.last_pnl.spread, self.last_pnl.inventory, self.last_pnl.hedge_cost],
-            dtype=np.float32,
-        )
+        observation = [
+            self.inventory,
+            price_feature,
+            self.last_pnl.spread,
+            self.last_pnl.inventory,
+            self.last_pnl.hedge_cost,
+        ]
+        if self.cfg.include_fill_feedback:
+            observation.extend(
+                [self.prev_bid_fill_fraction, self.prev_ask_fill_fraction]
+            )
+        return np.array(observation, dtype=np.float32)
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
         eps_bid, eps_ask, hedge_fraction = _clip_action(action)
@@ -48,10 +58,18 @@ class SingleDealerMarketEnv:
         # to P_t -> P_{t+1}, matching z_t(1-x_t) + v_t in Ganesh et al.
         self.inventory, hedge_cost = execute_hedge(self.inventory, hedge_fraction, self.price, self.cfg)
         spread_pnl = 0.0
+        bid_fills = ask_fills = 0
         for size, direction in generate_investor_orders(self.cfg, self.size_rng, self.direction_rng):
             epsilon = eps_bid if direction == 1 else eps_ask
             spread_pnl += size * reference_spread(self.price, size, self.cfg) * (1 + epsilon)
             self.inventory += direction * size
+            if direction > 0:
+                bid_fills += 1
+            else:
+                ask_fills += 1
+
+        self.prev_bid_fill_fraction = bid_fills / self.cfg.num_investors
+        self.prev_ask_fill_fraction = ask_fills / self.cfg.num_investors
 
         old_price = self.price
         self.price = evolve_mid_price(self.price, self.cfg, self.price_rng)
@@ -89,22 +107,37 @@ class TwoDealerMarketEnv:
         self.inventory = [0.0, 0.0]
         self.last_pnl = [PnL(), PnL()]
         self.market_share = [0.0, 0.0]
+        self.prev_bid_fill_fraction = [0.0, 0.0]
+        self.prev_ask_fill_fraction = [0.0, 0.0]
         self.t = 0
         return self._observation(0)
 
     def _observation(self, dealer: int) -> np.ndarray:
         pnl = self.last_pnl[dealer]
         price_feature = self.price / self.cfg.P0 - 1.0 if self.cfg.relative_price else self.price
-        return np.array(
-            [self.inventory[dealer], price_feature, pnl.total, pnl.inventory, pnl.hedge_cost],
-            dtype=np.float32,
-        )
+        observation = [
+            self.inventory[dealer],
+            price_feature,
+            pnl.total,
+            pnl.inventory,
+            pnl.hedge_cost,
+        ]
+        if self.cfg.include_fill_feedback:
+            observation.extend(
+                [
+                    self.prev_bid_fill_fraction[dealer],
+                    self.prev_ask_fill_fraction[dealer],
+                ]
+            )
+        return np.array(observation, dtype=np.float32)
 
     def step(self, rl_action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
         actions = [_clip_action(rl_action), _clip_action(self.competitor.act(self._observation(1)))]
         spread_pnl = [0.0, 0.0]
         step_volume = [0.0, 0.0]
         step_orders = [0, 0]
+        step_bid_fills = [0, 0]
+        step_ask_fills = [0, 0]
         hedge_costs = [0.0, 0.0]
         investor_buy_count = investor_sell_count = 0
         investor_buy_volume = investor_sell_volume = 0.0
@@ -138,6 +171,17 @@ class TwoDealerMarketEnv:
             self.inventory[winner] += direction * size
             step_volume[winner] += size
             step_orders[winner] += 1
+            if direction > 0:
+                step_bid_fills[winner] += 1
+            else:
+                step_ask_fills[winner] += 1
+
+        self.prev_bid_fill_fraction = [
+            fills / self.cfg.num_investors for fills in step_bid_fills
+        ]
+        self.prev_ask_fill_fraction = [
+            fills / self.cfg.num_investors for fills in step_ask_fills
+        ]
 
         old_price = self.price
         self.price = evolve_mid_price(self.price, self.cfg, self.price_rng)

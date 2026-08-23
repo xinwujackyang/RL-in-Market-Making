@@ -15,6 +15,7 @@ class Config:
     sigma: float = 0.2
     dt: float = 1.0 / (252 * 6.5 * 60 / 15)
     relative_price: bool = False
+    include_fill_feedback: bool = False
     num_investors: int = 20
     order_size_mode: str = "gamma"
     investor_shape: float = 2.0

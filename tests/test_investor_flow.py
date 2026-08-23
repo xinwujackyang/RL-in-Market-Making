@@ -88,6 +88,25 @@ class InvestorFlowTests(unittest.TestCase):
         self.assertEqual(raw_env.reset()[1], 100.0)
         self.assertEqual(relative_env.reset()[1], 0.0)
 
+    def test_fill_feedback_uses_previous_step_side_specific_fills(self) -> None:
+        cfg = Config(
+            num_investors=20,
+            order_size_mode="unit",
+            sigma=0.0,
+            include_fill_feedback=True,
+        )
+        env = TwoDealerMarketEnv(PersistentMarketMaker(), cfg, seed=23)
+        initial_observation = env.reset()
+        self.assertEqual(initial_observation.shape, (7,))
+        self.assertEqual(initial_observation[5:].tolist(), [0.0, 0.0])
+
+        next_observation, _, _, info = env.step(
+            np.array([-0.5, -0.5, 0.0], dtype=np.float32)
+        )
+        self.assertEqual(info["n_rl_won"], 20)
+        self.assertAlmostEqual(next_observation[5], info["n_sell"] / 20)
+        self.assertAlmostEqual(next_observation[6], info["n_buy"] / 20)
+
 
 if __name__ == "__main__":
     unittest.main()
