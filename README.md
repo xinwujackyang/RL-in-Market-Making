@@ -153,6 +153,8 @@ Detailed report: [`results/persistent_state_dependent_std/report_zh.md`](results
 
 ## Inventory-conditioned exploration
 
+![Inventory-conditioned exploration](figures/inventory_conditioned_exploration.png)
+
 The state-dependent variance is not arbitrary.
 
 Using 26,000 final evaluation states from five Persistent-competitor runs, inventory was divided into common quintiles and the learned bid/ask latent standard deviations were measured conditionally.
@@ -188,6 +190,8 @@ Detailed report: [`results/inventory_variance_analysis/report_zh.md`](results/in
 ---
 
 ## From unstable PPO to the current reference policy
+
+![PPO stabilization journey](figures/ppo_stabilization_journey.png)
 
 The most useful improvements came from a sequence of controlled changes rather than a hyperparameter sweep.
 
