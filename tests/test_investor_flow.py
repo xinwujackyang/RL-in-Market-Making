@@ -21,6 +21,7 @@ class InvestorFlowTests(unittest.TestCase):
         for changes in (
             {"num_investors": 0},
             {"order_size_mode": "lognormal"},
+            {"observation_mode": "transformer"},
             {"buy_probability": -0.1},
             {"buy_probability": 1.1},
         ):
@@ -120,6 +121,29 @@ class InvestorFlowTests(unittest.TestCase):
         self.assertAlmostEqual(next_observation[0], info["inventory"])
         self.assertAlmostEqual(next_observation[1], env.price / cfg.P0 - 1.0)
         self.assertAlmostEqual(next_observation[2], info["inventory_pnl"])
+
+    def test_paper_observation_contains_previous_routing_result(self) -> None:
+        cfg = Config(
+            relative_price=True,
+            observation_mode="paper",
+            num_investors=20,
+            order_size_mode="unit",
+            sigma=0.0,
+        )
+        env = TwoDealerMarketEnv(PersistentMarketMaker(), cfg, seed=37)
+        initial_observation = env.reset()
+        self.assertEqual(initial_observation.shape, (24,))
+        self.assertTrue(np.all(initial_observation[:20] == 0.0))
+        self.assertEqual(initial_observation[22], 0.0)
+
+        next_observation, _, _, info = env.step(
+            np.array([-0.5, -0.5, 0.0], dtype=np.float32)
+        )
+        previous_trades = next_observation[:20]
+        self.assertEqual(np.count_nonzero(previous_trades), info["n_rl_won"])
+        self.assertEqual(np.count_nonzero(previous_trades == 1.0), info["n_sell"])
+        self.assertEqual(np.count_nonzero(previous_trades == -1.0), info["n_buy"])
+        self.assertEqual(next_observation[22], info["n_rl_won"] / 20)
 
 
 if __name__ == "__main__":

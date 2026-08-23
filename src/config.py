@@ -17,6 +17,7 @@ class Config:
     relative_price: bool = False
     include_fill_feedback: bool = False
     paper_pnl_observation: bool = False
+    observation_mode: str = "default"
     num_investors: int = 20
     order_size_mode: str = "gamma"
     investor_shape: float = 2.0
@@ -65,6 +66,8 @@ class Config:
             raise ValueError("num_investors must be positive")
         if self.order_size_mode not in {"gamma", "unit"}:
             raise ValueError("order_size_mode must be 'gamma' or 'unit'")
+        if self.observation_mode not in {"default", "paper"}:
+            raise ValueError("observation_mode must be 'default' or 'paper'")
         if not 0.0 <= self.buy_probability <= 1.0:
             raise ValueError("buy_probability must lie in [0, 1]")
         if self.investor_shape <= 0.0 or self.investor_scale <= 0.0:
