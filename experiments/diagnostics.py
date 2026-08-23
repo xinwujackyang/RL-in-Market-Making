@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from config import Config
 from market import PnL, execute_hedge, generate_investor_orders, investor_execution_price, reference_spread
-from networks import SquashedNormal
+from networks import ActorCritic, SquashedNormal
 from ppo import RolloutBuffer, discount_cumsum
 
 
@@ -68,11 +68,20 @@ def main() -> None:
     expected_advantages = np.array([deltas[0] + 0.9 * 0.8 * deltas[1], deltas[1]])
     np.testing.assert_allclose(buffer.advantages, expected_advantages, rtol=1e-6)
 
+    network = ActorCritic(observation_dim=5, action_dim=3, hidden_size=16, hidden_layers=2)
+    observations = torch.ones(8, 5)
+    _, values = network.distribution_and_value(observations)
+    values.square().mean().backward()
+    actor_parameters = list(network.actor.parameters()) + list(network.policy_mean.parameters())
+    critic_parameters = list(network.critic.parameters()) + list(network.value_head.parameters())
+    assert all(parameter.grad is None for parameter in actor_parameters)
+    assert any(parameter.grad is not None for parameter in critic_parameters)
+
     print(f"A investor buys: ask={ask:.6f}, dealer inventory={sell_inventory:.1f}, up-move InvPnL={sell_inv_pnl:.1f}")
     print(f"B investor sells: bid={bid:.6f}, dealer inventory={buy_inventory:.1f}, up-move InvPnL={buy_inv_pnl:.1f}")
     print(f"C positive hedge: 10 -> {positive_after:.1f}, cost={positive_cost:.6f}")
     print(f"D negative hedge: -10 -> {negative_after:.1f}, cost={negative_cost:.6f}")
-    print("Gamma/unit flow, bounded-action, finite-log-probability, reward-identity, and bootstrap diagnostics passed.")
+    print("Gamma/unit flow, bounded-action, reward identity, bootstrap, and actor/critic gradient isolation diagnostics passed.")
 
 
 if __name__ == "__main__":

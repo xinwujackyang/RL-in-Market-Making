@@ -46,19 +46,27 @@ class SquashedNormal:
 class ActorCritic(nn.Module):
     def __init__(self, observation_dim: int, action_dim: int = 3, hidden_size: int = 256, hidden_layers: int = 2) -> None:
         super().__init__()
-        layers: list[nn.Module] = []
+        actor_layers: list[nn.Module] = []
         width = observation_dim
         for _ in range(hidden_layers):
-            layers.extend([nn.Linear(width, hidden_size), nn.Tanh()])
+            actor_layers.extend([nn.Linear(width, hidden_size), nn.Tanh()])
             width = hidden_size
-        self.shared = nn.Sequential(*layers)
+        self.actor = nn.Sequential(*actor_layers)
         self.policy_mean = nn.Linear(width, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
-        self.value_head = nn.Linear(width, 1)
+
+        critic_layers: list[nn.Module] = []
+        critic_width = observation_dim
+        for _ in range(hidden_layers):
+            critic_layers.extend([nn.Linear(critic_width, hidden_size), nn.Tanh()])
+            critic_width = hidden_size
+        self.critic = nn.Sequential(*critic_layers)
+        self.value_head = nn.Linear(critic_width, 1)
 
     def latent_mean_and_value(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden = self.shared(observations)
-        return self.policy_mean(hidden), self.value_head(hidden).squeeze(-1)
+        actor_hidden = self.actor(observations)
+        critic_hidden = self.critic(observations)
+        return self.policy_mean(actor_hidden), self.value_head(critic_hidden).squeeze(-1)
 
     def forward(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         latent_mean, value = self.latent_mean_and_value(observations)
