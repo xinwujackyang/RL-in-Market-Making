@@ -45,6 +45,7 @@ class Config:
     hidden_layers: int = 2
     fixed_policy_std: float | None = None
     state_dependent_std: bool = False
+    policy_distribution: str = "squashed_normal"
 
     # Experiment
     seed: int = 42
@@ -80,6 +81,8 @@ class Config:
             raise ValueError("kl_coef must be nonnegative")
         if self.vf_clip_param is not None and self.vf_clip_param <= 0.0:
             raise ValueError("vf_clip_param must be positive when set")
+        if self.policy_distribution not in {"squashed_normal", "beta"}:
+            raise ValueError("policy_distribution must be 'squashed_normal' or 'beta'")
 
 
 def seed_everything(seed: int) -> None:

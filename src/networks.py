@@ -43,6 +43,39 @@ class SquashedNormal:
         return self.base.entropy()
 
 
+class ScaledBeta:
+    """Independent Beta actions transformed to [-1, 1], [-1, 1], and [0, 1]."""
+
+    def __init__(self, alpha: torch.Tensor, beta: torch.Tensor) -> None:
+        self.base = torch.distributions.Beta(alpha, beta)
+
+    @staticmethod
+    def _transform(unit_action: torch.Tensor) -> torch.Tensor:
+        return torch.cat([2.0 * unit_action[..., :2] - 1.0, unit_action[..., 2:]], dim=-1)
+
+    @staticmethod
+    def _inverse(action: torch.Tensor) -> torch.Tensor:
+        eps = torch.finfo(action.dtype).eps
+        unit_action = torch.cat([(action[..., :2] + 1.0) / 2.0, action[..., 2:]], dim=-1)
+        return unit_action.clamp(eps, 1.0 - eps)
+
+    def sample(self) -> torch.Tensor:
+        return self._transform(self.base.sample())
+
+    def rsample(self) -> torch.Tensor:
+        return self._transform(self.base.rsample())
+
+    def log_prob(self, action: torch.Tensor) -> torch.Tensor:
+        unit_action = self._inverse(action)
+        log_prob = self.base.log_prob(unit_action)
+        log_prob = log_prob.clone()
+        log_prob[..., :2] -= torch.log(torch.tensor(2.0, device=action.device))
+        return log_prob
+
+    def entropy(self) -> torch.Tensor:
+        return self.base.entropy()
+
+
 class ActorCritic(nn.Module):
     def __init__(
         self,
@@ -51,6 +84,7 @@ class ActorCritic(nn.Module):
         hidden_size: int = 256,
         hidden_layers: int = 2,
         state_dependent_std: bool = False,
+        policy_distribution: str = "squashed_normal",
     ) -> None:
         super().__init__()
         actor_layers: list[nn.Module] = []
@@ -61,12 +95,21 @@ class ActorCritic(nn.Module):
         self.actor = nn.Sequential(*actor_layers)
         self.policy_mean = nn.Linear(width, action_dim)
         self.state_dependent_std = state_dependent_std
-        if state_dependent_std:
+        self.policy_distribution = policy_distribution
+        if policy_distribution == "beta":
+            self.policy_log_concentration = nn.Linear(width, action_dim)
+            nn.init.zeros_(self.policy_log_concentration.weight)
+            nn.init.zeros_(self.policy_log_concentration.bias)
+            self.policy_log_std = None
+            self.register_parameter("log_std", None)
+        elif state_dependent_std:
+            self.policy_log_concentration = None
             self.policy_log_std = nn.Linear(width, action_dim)
             nn.init.zeros_(self.policy_log_std.weight)
             nn.init.zeros_(self.policy_log_std.bias)
             self.register_parameter("log_std", None)
         else:
+            self.policy_log_concentration = None
             self.policy_log_std = None
             self.log_std = nn.Parameter(torch.zeros(action_dim))
 
@@ -81,6 +124,8 @@ class ActorCritic(nn.Module):
     def latent_policy_parameters(
         self, observations: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.policy_distribution != "squashed_normal":
+            raise ValueError("latent_policy_parameters is only defined for Gaussian policies")
         actor_hidden = self.actor(observations)
         mean = self.policy_mean(actor_hidden)
         if self.policy_log_std is not None:
@@ -90,7 +135,8 @@ class ActorCritic(nn.Module):
         return mean, log_std
 
     def latent_mean_and_value(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        mean, _ = self.latent_policy_parameters(observations)
+        actor_hidden = self.actor(observations)
+        mean = self.policy_mean(actor_hidden)
         critic_hidden = self.critic(observations)
         return mean, self.value_head(critic_hidden).squeeze(-1)
 
@@ -99,8 +145,21 @@ class ActorCritic(nn.Module):
         return SquashedNormal._transform(latent_mean), value
 
     def distribution_and_value(self, observations: torch.Tensor):
-        mean, log_std = self.latent_policy_parameters(observations)
+        actor_hidden = self.actor(observations)
+        mean = self.policy_mean(actor_hidden)
         critic_hidden = self.critic(observations)
         value = self.value_head(critic_hidden).squeeze(-1)
-        distribution = SquashedNormal(mean, log_std.exp())
+        if self.policy_distribution == "beta":
+            unit_mean = torch.sigmoid(2.0 * mean)
+            concentration = 1.54 * self.policy_log_concentration(actor_hidden).exp()
+            distribution = ScaledBeta(
+                unit_mean * concentration,
+                (1.0 - unit_mean) * concentration,
+            )
+        else:
+            if self.policy_log_std is not None:
+                log_std = self.policy_log_std(actor_hidden)
+            else:
+                log_std = self.log_std.expand_as(mean)
+            distribution = SquashedNormal(mean, log_std.exp())
         return distribution, value

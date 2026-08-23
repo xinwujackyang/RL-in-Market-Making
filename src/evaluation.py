@@ -17,7 +17,10 @@ def evaluate_policy(
         total = competitor_total = 0.0
         for _ in range(steps):
             series["inventory_before_action"].append(float(observation[0]))
-            if hasattr(agent, "latent_std"):
+            if (
+                hasattr(agent, "latent_std")
+                and agent.cfg.policy_distribution == "squashed_normal"
+            ):
                 latent_std = agent.latent_std(observation)
                 series["latent_std_bid"].append(float(latent_std[0]))
                 series["latent_std_ask"].append(float(latent_std[1]))
