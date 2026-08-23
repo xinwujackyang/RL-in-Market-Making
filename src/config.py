@@ -37,6 +37,7 @@ class Config:
     lr: float = 5e-5
     vf_coef: float = 0.5
     ent_coef: float = 3e-3
+    kl_coef: float = 0.0
     max_grad_norm: float = 0.5
     hidden_size: int = 256
     hidden_layers: int = 2
@@ -72,6 +73,8 @@ class Config:
             raise ValueError("buy_probability must lie in [0, 1]")
         if self.investor_shape <= 0.0 or self.investor_scale <= 0.0:
             raise ValueError("Gamma order-size parameters must be positive")
+        if self.kl_coef < 0.0:
+            raise ValueError("kl_coef must be nonnegative")
 
 
 def seed_everything(seed: int) -> None:

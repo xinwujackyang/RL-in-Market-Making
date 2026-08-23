@@ -19,6 +19,24 @@ def discount_cumsum(values: np.ndarray, discount: float) -> np.ndarray:
     return result
 
 
+def diagonal_gaussian_kl(
+    old_mean: torch.Tensor,
+    old_log_std: torch.Tensor,
+    new_mean: torch.Tensor,
+    new_log_std: torch.Tensor,
+) -> torch.Tensor:
+    """Per-sample KL(old || new), summed over independent action dimensions."""
+    old_variance = torch.exp(2.0 * old_log_std)
+    new_variance = torch.exp(2.0 * new_log_std)
+    per_dimension = (
+        new_log_std
+        - old_log_std
+        + (old_variance + (old_mean - new_mean).square()) / (2.0 * new_variance)
+        - 0.5
+    )
+    return per_dimension.sum(dim=-1)
+
+
 class RolloutBuffer:
     def __init__(self, observation_dim: int, action_dim: int, size: int, cfg: Config) -> None:
         self.observations = np.zeros((size, observation_dim), dtype=np.float32)
@@ -152,6 +170,11 @@ class PPOAgent:
 
     def _update(self) -> dict:
         observations, actions, advantages, returns, old_log_probs = self.buffer.get()
+        old_means = old_log_std = None
+        if self.cfg.kl_coef > 0.0:
+            with torch.no_grad():
+                old_means, _ = self.network.latent_mean_and_value(observations)
+                old_log_std = self.network.log_std.detach().clone()
         log_std_gradients = []
         log_std_gradient_vectors = []
         actor_mean_gradients = []
@@ -159,6 +182,7 @@ class PPOAgent:
         policy_losses = []
         value_losses = []
         approx_kls = []
+        analytic_kls = []
         clip_fractions = []
         for _ in range(self.cfg.n_epochs):
             indices = np.random.permutation(self.cfg.horizon)
@@ -172,6 +196,15 @@ class PPOAgent:
                 policy_loss = -torch.min(objective, clipped).mean()
                 value_loss = (returns[batch] - values).square().mean()
                 entropy = distribution.entropy().sum(-1).mean()
+                if old_means is not None and old_log_std is not None:
+                    analytic_kl = diagonal_gaussian_kl(
+                        old_means[batch],
+                        old_log_std,
+                        distribution.base.loc,
+                        self.network.log_std,
+                    ).mean()
+                else:
+                    analytic_kl = torch.zeros((), device=self.cfg.device)
                 with torch.no_grad():
                     approx_kls.append((old_log_probs[batch] - log_probs).mean().item())
                     clip_fractions.append(
@@ -179,7 +212,13 @@ class PPOAgent:
                     )
                 policy_losses.append(policy_loss.detach().item())
                 value_losses.append(value_loss.detach().item())
-                loss = policy_loss + self.cfg.vf_coef * value_loss - self.cfg.ent_coef * entropy
+                analytic_kls.append(analytic_kl.detach().item())
+                loss = (
+                    policy_loss
+                    + self.cfg.vf_coef * value_loss
+                    - self.cfg.ent_coef * entropy
+                    + self.cfg.kl_coef * analytic_kl
+                )
                 self.optimizer.zero_grad()
                 loss.backward()
                 if self.network.log_std.grad is not None:
@@ -214,6 +253,7 @@ class PPOAgent:
             "policy_loss": float(np.mean(policy_losses)),
             "value_loss": float(np.mean(value_losses)),
             "approx_kl": float(np.mean(approx_kls)),
+            "analytic_kl": float(np.mean(analytic_kls)),
             "clip_fraction": float(np.mean(clip_fractions)),
             "mean_abs_grad_log_std": float(np.mean(log_std_gradients)),
             "mean_grad_log_std_bid": float(mean_log_std_gradient[0]),
