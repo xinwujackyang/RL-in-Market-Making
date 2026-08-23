@@ -38,13 +38,16 @@ class SingleDealerMarketEnv:
 
     def _observation(self) -> np.ndarray:
         price_feature = self.price / self.cfg.P0 - 1.0 if self.cfg.relative_price else self.price
-        observation = [
-            self.inventory,
-            price_feature,
-            self.last_pnl.spread,
-            self.last_pnl.inventory,
-            self.last_pnl.hedge_cost,
-        ]
+        if self.cfg.paper_pnl_observation:
+            observation = [self.inventory, price_feature, self.last_pnl.inventory]
+        else:
+            observation = [
+                self.inventory,
+                price_feature,
+                self.last_pnl.spread,
+                self.last_pnl.inventory,
+                self.last_pnl.hedge_cost,
+            ]
         if self.cfg.include_fill_feedback:
             observation.extend(
                 [self.prev_bid_fill_fraction, self.prev_ask_fill_fraction]
@@ -115,13 +118,16 @@ class TwoDealerMarketEnv:
     def _observation(self, dealer: int) -> np.ndarray:
         pnl = self.last_pnl[dealer]
         price_feature = self.price / self.cfg.P0 - 1.0 if self.cfg.relative_price else self.price
-        observation = [
-            self.inventory[dealer],
-            price_feature,
-            pnl.total,
-            pnl.inventory,
-            pnl.hedge_cost,
-        ]
+        if self.cfg.paper_pnl_observation:
+            observation = [self.inventory[dealer], price_feature, pnl.inventory]
+        else:
+            observation = [
+                self.inventory[dealer],
+                price_feature,
+                pnl.total,
+                pnl.inventory,
+                pnl.hedge_cost,
+            ]
         if self.cfg.include_fill_feedback:
             observation.extend(
                 [

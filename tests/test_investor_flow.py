@@ -107,6 +107,20 @@ class InvestorFlowTests(unittest.TestCase):
         self.assertAlmostEqual(next_observation[5], info["n_sell"] / 20)
         self.assertAlmostEqual(next_observation[6], info["n_buy"] / 20)
 
+    def test_paper_pnl_observation_has_three_features_in_order(self) -> None:
+        cfg = Config(relative_price=True, paper_pnl_observation=True)
+        env = TwoDealerMarketEnv(PersistentMarketMaker(), cfg, seed=31)
+        initial_observation = env.reset()
+        self.assertEqual(initial_observation.shape, (3,))
+        self.assertEqual(initial_observation.tolist(), [0.0, 0.0, 0.0])
+
+        next_observation, _, _, info = env.step(
+            np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        )
+        self.assertAlmostEqual(next_observation[0], info["inventory"])
+        self.assertAlmostEqual(next_observation[1], env.price / cfg.P0 - 1.0)
+        self.assertAlmostEqual(next_observation[2], info["inventory_pnl"])
+
 
 if __name__ == "__main__":
     unittest.main()
