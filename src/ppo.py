@@ -107,7 +107,12 @@ class PPOAgent:
         distribution, _ = self.network.distribution_and_value(obs)
         return distribution.entropy().sum(-1).item()
 
-    def train(self, evaluator=None, risk_penalty: bool = False) -> TrainingHistory:
+    def train(
+        self,
+        evaluator=None,
+        risk_penalty: bool = False,
+        evaluation_steps: set[int] | None = None,
+    ) -> TrainingHistory:
         observation = self.env.reset()
         total_steps = 0
         rollout_reward = 0.0
@@ -134,7 +139,12 @@ class PPOAgent:
             self.history.steps.append(total_steps)
             self.history.rewards.append(rollout_reward)
             rollout_reward = 0.0
-            if evaluator and (total_steps % self.cfg.eval_every_steps == 0 or total_steps == self.cfg.total_steps):
+            scheduled_evaluation = (
+                total_steps in evaluation_steps
+                if evaluation_steps is not None
+                else total_steps % self.cfg.eval_every_steps == 0
+            )
+            if evaluator and (scheduled_evaluation or total_steps == self.cfg.total_steps):
                 metrics = evaluator(self)
                 self.history.evaluation.append({"step": total_steps, **metrics})
                 print(f"step {total_steps:>7}: mean PnL {metrics['mean_total_pnl']:.3f}")

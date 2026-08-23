@@ -35,6 +35,7 @@ python experiments/analytical_response.py    # stochastic-policy best response
 python experiments/risk_aversion.py           # paired three-seed comparison
 python experiments/investor_flow_investigation.py  # Gamma vs paper unit flow
 python experiments/paper_aligned_ppo.py             # unit-flow current vs paper PPO clip
+python experiments/long_run_random.py               # 204,800-step convergence study
 ```
 
 The investor-flow investigation keeps the current PPO fixed and compares the
@@ -49,6 +50,11 @@ minibatches of 256. The controlled comparison changes only PPO clip from `0.2`
 to the paper-reported `0.3`, records deterministic mean-policy and latent-sigma
 trajectories every rollout, and writes its five-seed report under
 `results/paper_aligned_ppo/`.
+
+The long-run Random study holds that paper-oriented setup fixed and changes
+only the training budget from 20 to 200 rollouts. It uses sparse deterministic
+evaluation checkpoints and writes five-seed convergence trajectories under
+`results/long_run_random/`.
 
 ### Analytical best response
 
