@@ -33,6 +33,7 @@ class Config:
     minibatch_size: int = 256
     gamma: float = 0.999
     gae_lambda: float = 0.95
+    gae_value_target: bool = False
     clip_eps: float = 0.2
     lr: float = 5e-5
     vf_coef: float = 0.5

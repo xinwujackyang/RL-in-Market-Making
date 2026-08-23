@@ -64,8 +64,13 @@ class RolloutBuffer:
         rewards = np.append(self.rewards[path], last_value)
         values = np.append(self.values[path], last_value)
         deltas = rewards[:-1] + self.cfg.gamma * values[1:] - values[:-1]
-        self.advantages[path] = discount_cumsum(deltas, self.cfg.gamma * self.cfg.gae_lambda)
-        self.returns[path] = discount_cumsum(rewards, self.cfg.gamma)[:-1]
+        raw_advantages = discount_cumsum(deltas, self.cfg.gamma * self.cfg.gae_lambda)
+        self.advantages[path] = raw_advantages
+        if self.cfg.gae_value_target:
+            # In this mode, `returns` stores the unnormalized GAE lambda-return target.
+            self.returns[path] = self.values[path] + raw_advantages
+        else:
+            self.returns[path] = discount_cumsum(rewards, self.cfg.gamma)[:-1]
         self.path_start = self.pointer
 
     def get(self) -> tuple[torch.Tensor, ...]:
