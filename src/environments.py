@@ -35,8 +35,9 @@ class SingleDealerMarketEnv:
         return self._observation()
 
     def _observation(self) -> np.ndarray:
+        price_feature = self.price / self.cfg.P0 - 1.0 if self.cfg.relative_price else self.price
         return np.array(
-            [self.inventory, self.price, self.last_pnl.spread, self.last_pnl.inventory, self.last_pnl.hedge_cost],
+            [self.inventory, price_feature, self.last_pnl.spread, self.last_pnl.inventory, self.last_pnl.hedge_cost],
             dtype=np.float32,
         )
 
@@ -93,7 +94,11 @@ class TwoDealerMarketEnv:
 
     def _observation(self, dealer: int) -> np.ndarray:
         pnl = self.last_pnl[dealer]
-        return np.array([self.inventory[dealer], self.price, pnl.total, pnl.inventory, pnl.hedge_cost], dtype=np.float32)
+        price_feature = self.price / self.cfg.P0 - 1.0 if self.cfg.relative_price else self.price
+        return np.array(
+            [self.inventory[dealer], price_feature, pnl.total, pnl.inventory, pnl.hedge_cost],
+            dtype=np.float32,
+        )
 
     def step(self, rl_action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
         actions = [_clip_action(rl_action), _clip_action(self.competitor.act(self._observation(1)))]

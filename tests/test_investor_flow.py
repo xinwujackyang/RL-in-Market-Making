@@ -80,6 +80,14 @@ class InvestorFlowTests(unittest.TestCase):
             self.assertEqual(gamma_info["n_sell"], unit_info["n_sell"])
             self.assertEqual(gamma_observation[1], unit_observation[1])
 
+    def test_relative_price_is_zero_at_inception(self) -> None:
+        raw_env = TwoDealerMarketEnv(PersistentMarketMaker(), Config(), seed=7)
+        relative_env = TwoDealerMarketEnv(
+            PersistentMarketMaker(), Config(relative_price=True), seed=7
+        )
+        self.assertEqual(raw_env.reset()[1], 100.0)
+        self.assertEqual(relative_env.reset()[1], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
