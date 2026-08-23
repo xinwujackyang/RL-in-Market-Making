@@ -63,6 +63,7 @@ class TrainingHistory:
     steps: list[int] = field(default_factory=list)
     rewards: list[float] = field(default_factory=list)
     evaluation: list[dict] = field(default_factory=list)
+    diagnostics: list[dict] = field(default_factory=list)
 
 
 class PPOAgent:
@@ -74,6 +75,12 @@ class PPOAgent:
         self.network = ActorCritic(
             observation_dim, 3, self.cfg.hidden_size, self.cfg.hidden_layers
         ).to(self.cfg.device)
+        if self.cfg.fixed_policy_std is not None:
+            if self.cfg.fixed_policy_std <= 0:
+                raise ValueError("fixed_policy_std must be positive")
+            with torch.no_grad():
+                self.network.log_std.fill_(float(np.log(self.cfg.fixed_policy_std)))
+            self.network.log_std.requires_grad_(False)
         self.optimizer = torch.optim.Adam(self.network.parameters(), lr=self.cfg.lr)
         self.buffer = RolloutBuffer(observation_dim, 3, self.cfg.horizon, self.cfg)
         self.history = TrainingHistory()
@@ -90,6 +97,15 @@ class PPOAgent:
     def deterministic_action(self, observation: np.ndarray) -> np.ndarray:
         obs = torch.as_tensor(observation, dtype=torch.float32, device=self.cfg.device)
         return self.network(obs)[0].cpu().numpy()
+
+    def sample_action(self, observation: np.ndarray) -> np.ndarray:
+        return self.select_action(observation)[0]
+
+    @torch.no_grad()
+    def policy_entropy(self, observation: np.ndarray) -> float:
+        obs = torch.as_tensor(observation, dtype=torch.float32, device=self.cfg.device)
+        distribution, _ = self.network.distribution_and_value(obs)
+        return distribution.entropy().sum(-1).item()
 
     def train(self, evaluator=None, risk_penalty: bool = False) -> TrainingHistory:
         observation = self.env.reset()
@@ -112,7 +128,9 @@ class PPOAgent:
                 obs = torch.as_tensor(observation, dtype=torch.float32, device=self.cfg.device)
                 last_value = self.network.distribution_and_value(obs)[1].item()
             self.buffer.finish_path(last_value)
-            self._update()
+            diagnostics = self._update()
+            diagnostics["step"] = total_steps
+            self.history.diagnostics.append(diagnostics)
             self.history.steps.append(total_steps)
             self.history.rewards.append(rollout_reward)
             rollout_reward = 0.0
@@ -122,8 +140,12 @@ class PPOAgent:
                 print(f"step {total_steps:>7}: mean PnL {metrics['mean_total_pnl']:.3f}")
         return self.history
 
-    def _update(self) -> None:
+    def _update(self) -> dict:
         observations, actions, advantages, returns, old_log_probs = self.buffer.get()
+        log_std_gradients = []
+        log_std_gradient_vectors = []
+        actor_mean_gradients = []
+        entropies = []
         for _ in range(self.cfg.n_epochs):
             indices = np.random.permutation(self.cfg.horizon)
             for start in range(0, self.cfg.horizon, self.cfg.minibatch_size):
@@ -139,5 +161,44 @@ class PPOAgent:
                 loss = policy_loss + self.cfg.vf_coef * value_loss - self.cfg.ent_coef * entropy
                 self.optimizer.zero_grad()
                 loss.backward()
+                if self.network.log_std.grad is not None:
+                    log_std_gradients.append(self.network.log_std.grad.detach().abs().mean().item())
+                    log_std_gradient_vectors.append(
+                        self.network.log_std.grad.detach().cpu().numpy().copy()
+                    )
+                else:
+                    log_std_gradients.append(0.0)
+                    log_std_gradient_vectors.append(np.zeros(3, dtype=np.float32))
+                actor_grad_sum = 0.0
+                actor_grad_count = 0
+                for parameter in self.network.policy_mean.parameters():
+                    if parameter.grad is not None:
+                        actor_grad_sum += parameter.grad.detach().abs().sum().item()
+                        actor_grad_count += parameter.grad.numel()
+                actor_mean_gradients.append(actor_grad_sum / max(actor_grad_count, 1))
+                entropies.append(entropy.detach().item())
                 nn.utils.clip_grad_norm_(self.network.parameters(), self.cfg.max_grad_norm)
                 self.optimizer.step()
+        log_std = self.network.log_std.detach().cpu().numpy()
+        latent_std = np.exp(log_std)
+        mean_log_std_gradient = np.mean(log_std_gradient_vectors, axis=0)
+        return {
+            "log_std_bid": float(log_std[0]),
+            "log_std_ask": float(log_std[1]),
+            "log_std_hedge": float(log_std[2]),
+            "latent_std_bid": float(latent_std[0]),
+            "latent_std_ask": float(latent_std[1]),
+            "latent_std_hedge": float(latent_std[2]),
+            "entropy_proxy": float(np.mean(entropies)),
+            "mean_abs_grad_log_std": float(np.mean(log_std_gradients)),
+            "mean_grad_log_std_bid": float(mean_log_std_gradient[0]),
+            "mean_grad_log_std_ask": float(mean_log_std_gradient[1]),
+            "mean_grad_log_std_hedge": float(mean_log_std_gradient[2]),
+            "entropy_grad_log_std": float(
+                -self.cfg.ent_coef if self.network.log_std.requires_grad else 0.0
+            ),
+            "mean_abs_grad_actor_mean": float(np.mean(actor_mean_gradients)),
+            "grad_ratio_log_std_to_actor_mean": float(
+                np.mean(log_std_gradients) / (np.mean(actor_mean_gradients) + 1e-12)
+            ),
+        }

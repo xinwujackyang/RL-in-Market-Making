@@ -1,0 +1,10 @@
+mean_epsilon_bid: 0.03042940087390889
+mean_epsilon_ask: -0.0085424311130527
+epsilon_bid_std: 0.5287557850104152
+epsilon_ask_std: 0.5318760881765542
+deterministic_mean_epsilon_bid: 0.06007667812088934
+deterministic_mean_epsilon_ask: -0.014208443894122656
+mean_market_share: 0.7726304820046246
+latent_std_bid: 0.7177918553352356
+latent_std_ask: 0.721646249294281
+mean_spread_pnl: 0.5779983794537142

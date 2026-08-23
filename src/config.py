@@ -14,9 +14,11 @@ class Config:
     mu: float = 0.0
     sigma: float = 0.2
     dt: float = 1.0 / (252 * 6.5 * 60 / 15)
-    n_investors: int = 20
+    num_investors: int = 20
+    order_size_mode: str = "gamma"
     investor_shape: float = 2.0
     investor_scale: float = 1.0
+    buy_probability: float = 0.5
     base_spread_bp: float = 2.0
     lob_slope_bp: float = 0.2
 
@@ -34,6 +36,7 @@ class Config:
     max_grad_norm: float = 0.5
     hidden_size: int = 256
     hidden_layers: int = 2
+    fixed_policy_std: float | None = None
 
     # Experiment
     seed: int = 42
@@ -53,6 +56,16 @@ class Config:
 
     def updated(self, **changes: object) -> "Config":
         return replace(self, **changes)
+
+    def __post_init__(self) -> None:
+        if self.num_investors <= 0:
+            raise ValueError("num_investors must be positive")
+        if self.order_size_mode not in {"gamma", "unit"}:
+            raise ValueError("order_size_mode must be 'gamma' or 'unit'")
+        if not 0.0 <= self.buy_probability <= 1.0:
+            raise ValueError("buy_probability must lie in [0, 1]")
+        if self.investor_shape <= 0.0 or self.investor_scale <= 0.0:
+            raise ValueError("Gamma order-size parameters must be positive")
 
 
 def seed_everything(seed: int) -> None:

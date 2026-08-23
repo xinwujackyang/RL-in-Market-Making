@@ -5,7 +5,9 @@ from collections import defaultdict
 import numpy as np
 
 
-def evaluate_policy(agent, env_factory, episodes: int, steps: int) -> tuple[dict, dict[str, np.ndarray]]:
+def evaluate_policy(
+    agent, env_factory, episodes: int, steps: int, deterministic: bool = True
+) -> tuple[dict, dict[str, np.ndarray]]:
     episode_totals = []
     episode_competitor_totals = []
     series: dict[str, list[float]] = defaultdict(list)
@@ -14,9 +16,17 @@ def evaluate_policy(agent, env_factory, episodes: int, steps: int) -> tuple[dict
         observation = env.reset()
         total = competitor_total = 0.0
         for _ in range(steps):
-            action = agent.deterministic_action(observation)
+            series["inventory_before_action"].append(float(observation[0]))
+            action = (
+                agent.deterministic_action(observation)
+                if deterministic
+                else agent.sample_action(observation)
+            )
+            series["policy_entropy"].append(agent.policy_entropy(observation))
             observation, reward, _, info = env.step(action)
-            total += reward
+            # Report economic total PnL even when a diagnostic environment is
+            # intentionally trained on a spread-only reward.
+            total += info["total_pnl"]
             competitor_total += info.get("competitor_pnl", 0.0)
             series["inventory"].append(info["inventory"])
             series["spread_pnl"].append(info["spread_pnl"])
@@ -24,36 +34,88 @@ def evaluate_policy(agent, env_factory, episodes: int, steps: int) -> tuple[dict
             series["hedge_cost"].append(info["hedge_cost"])
             series["epsilon_bid"].append(float(action[0]))
             series["epsilon_ask"].append(float(action[1]))
+            series["hedge_fraction"].append(float(action[2]))
             if "market_share" in info:
                 series["market_share"].append(info["market_share"])
+            for key in (
+                "n_buy",
+                "n_sell",
+                "n_rl_won",
+                "n_competitor_won",
+                "gross_investor_volume",
+                "net_investor_flow",
+            ):
+                if key in info:
+                    series[key].append(info[key])
         episode_totals.append(total)
         if hasattr(env, "competitor"):
             episode_competitor_totals.append(competitor_total)
 
     data = {key: np.asarray(values) for key, values in series.items()}
     metrics = {
+        "deterministic_evaluation": deterministic,
         "mean_total_pnl": float(np.mean(episode_totals)),
+        "mean_total_pnl_per_step": float(np.mean(episode_totals) / steps),
         "pnl_std": float(np.std(episode_totals)),
         "mean_spread_pnl": float(data["spread_pnl"].mean()),
+        "spread_pnl_std": float(data["spread_pnl"].std()),
         "mean_inventory_pnl": float(data["inventory_pnl"].mean()),
+        "inventory_pnl_std": float(data["inventory_pnl"].std()),
         "mean_hedge_cost": float(data["hedge_cost"].mean()),
         "mean_inventory": float(data["inventory"].mean()),
         "inventory_std": float(data["inventory"].std()),
         "max_abs_inventory": float(np.abs(data["inventory"]).max()),
         "mean_epsilon_bid": float(data["epsilon_bid"].mean()),
+        "epsilon_bid_std": float(data["epsilon_bid"].std()),
         "mean_epsilon_ask": float(data["epsilon_ask"].mean()),
+        "epsilon_ask_std": float(data["epsilon_ask"].std()),
+        "mean_hedge_fraction": float(data["hedge_fraction"].mean()),
+        "hedge_fraction_std": float(data["hedge_fraction"].std()),
+        "epsilon_near_bound_frequency": float(
+            np.mean(
+                np.concatenate(
+                    [np.abs(data["epsilon_bid"]) > 0.99, np.abs(data["epsilon_ask"]) > 0.99]
+                )
+            )
+        ),
+        "hedge_near_bound_frequency": float(
+            np.mean((data["hedge_fraction"] < 0.01) | (data["hedge_fraction"] > 0.99))
+        ),
+        "mean_policy_entropy_proxy": float(data["policy_entropy"].mean()),
     }
+    if hasattr(agent, "network"):
+        latent_std = agent.network.log_std.detach().exp().cpu().numpy()
+        metrics.update(
+            latent_std_bid=float(latent_std[0]),
+            latent_std_ask=float(latent_std[1]),
+            latent_std_hedge=float(latent_std[2]),
+        )
     if episode_competitor_totals:
         metrics["mean_competitor_pnl"] = float(np.mean(episode_competitor_totals))
         metrics["competitor_pnl_std"] = float(np.std(episode_competitor_totals))
         metrics["mean_market_share"] = float(data["market_share"].mean())
+        for key in (
+            "n_buy",
+            "n_sell",
+            "n_rl_won",
+            "n_competitor_won",
+            "gross_investor_volume",
+            "net_investor_flow",
+            "market_share",
+        ):
+            metrics[f"{key}_mean"] = float(data[key].mean())
+            metrics[f"{key}_std"] = float(data[key].std())
     return metrics, data
 
 
 def print_metrics(metrics: dict) -> None:
     print("\nEvaluation")
     for name, value in metrics.items():
-        print(f"  {name.replace('_', ' '):26s} {value:12.4f}")
+        label = name.replace("_", " ")
+        if isinstance(value, bool):
+            print(f"  {label:26s} {str(value):>12s}")
+        else:
+            print(f"  {label:26s} {value:12.4f}")
 
 
 def evaluate_baseline(policy, env_factory, episodes: int, steps: int) -> dict:

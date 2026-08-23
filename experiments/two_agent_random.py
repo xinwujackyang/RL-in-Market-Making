@@ -32,7 +32,7 @@ def main() -> None:
     history = agent.train(evaluator=evaluator)
     metrics, data = evaluate_policy(agent, env_factory, cfg.eval_episodes, steps)
     print_metrics(metrics)
-    print("Analytical comparison from the paper should use the epsilon means above; formal correctness is deferred.")
+    print("The deterministic analytical benchmark is epsilon=0; use replication_study.py for sampled five-seed results.")
     output = ROOT / "results" / "two_agent_random.png"
     output.parent.mkdir(exist_ok=True)
     save_plots(history, data, str(output), competitor=True)

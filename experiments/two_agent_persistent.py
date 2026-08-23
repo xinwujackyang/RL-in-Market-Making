@@ -32,7 +32,7 @@ def main() -> None:
     history = agent.train(evaluator=evaluator)
     metrics, data = evaluate_policy(agent, env_factory, cfg.eval_episodes, steps)
     print_metrics(metrics)
-    print("Note: convergence against the persistent competitor was unstable in the original project.")
+    print("Persistent routing is discontinuous; see analytical_response.py for the variance-adjusted benchmark.")
     output = ROOT / "results" / "two_agent_persistent.png"
     output.parent.mkdir(exist_ok=True)
     save_plots(history, data, str(output), competitor=True)

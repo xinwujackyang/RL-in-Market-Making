@@ -1,43 +1,89 @@
 # RL Market Making
 
-A minimal research codebase extracted from the original notebook implementation of PPO market makers. The original artifacts are preserved unchanged in `archive/`; implementation lives in `src/`, executable studies in `experiments/`, and the notebook is analysis-only.
+A compact research implementation of PPO market makers in a simulated dealer market, extracted from the original notebook project and audited for action-distribution, accounting, sign, and event-timing correctness. Original artifacts remain unchanged in `archive/`.
 
-## Setup
+## Model
+
+At each step a dealer observes its inventory, GBM mid-price, and previous PnL components, then chooses bid epsilon, ask epsilon, and a hedge fraction. Investor sizes are Gamma-distributed; each investor trades with the dealer offering the best price. In the two-dealer environment an RL dealer competes with either a random or persistent policy.
+
+The event sequence is explicit: hedge inventory known at decision time, execute investor flow, evolve the mid-price, and realize inventory PnL on post-hedge/post-flow inventory. Dealer buys are positive inventory and dealer sells are negative. See `docs/correctness_audit.md` for the equations and hand-worked sign examples.
+
+The custom PPO implementation includes GAE-lambda, clipped policy loss, value loss, entropy regularization, minibatches, and gradient clipping. Continuous actions use a tanh-squashed Gaussian with a Jacobian-corrected log probability; the hedge transform includes its `[0,1]` scale adjustment. The action stored by PPO is exactly the action executed by the simulator.
+
+The complete audit conclusions and direct answers to the replication stop questions are in `docs/replication_findings.md`.
+
+## Setup and core experiments
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
 
-## Experiments
-
-```bash
+python experiments/diagnostics.py
 python experiments/single_agent.py
 python experiments/two_agent_random.py
 python experiments/two_agent_persistent.py
 ```
 
-Each command trains PPO, evaluates the deterministic policy, prints PnL and behavior statistics, and writes a four-panel plot under `results/`. Useful options are `--rollouts`, `--horizon`, `--eval-episodes`, and `--eval-days`. The single-agent experiment also supports `--risk-penalty`.
+The defaults use 20 rollouts of 1,024 steps for iteration. Override `--rollouts`, `--horizon`, `--eval-episodes`, and `--eval-days` for longer studies.
 
-The defaults (20 rollouts of 1,024 steps) are intended for iteration. The original notebooks used 300 rollouts for the single-agent study and 100 rollouts of 2,048 steps for two-agent studies. For example:
+## Correctness and replication studies
 
 ```bash
-python experiments/two_agent_random.py --rollouts 100 --horizon 2048
+python experiments/replication_study.py       # five seeds by default
+python experiments/analytical_response.py    # stochastic-policy best response
+python experiments/risk_aversion.py           # paired three-seed comparison
+python experiments/investor_flow_investigation.py  # Gamma vs paper unit flow
 ```
 
-## Layout
+The investor-flow investigation keeps the current PPO fixed and compares the
+default 20 Gamma-size orders with 20 paper-style unit orders under paired random
+competitor seeds. Its Chinese report and latent-standard-deviation trajectory are
+under `results/investor_flow/`. Run `--phase paper-ppo` only if the flow-only
+comparison warrants the conditional full-paper configuration.
 
-- `src/config.py`: one dataclass containing market, PPO, and experiment settings.
-- `src/market.py`: GBM, investor flow, spread, hedge, and PnL mechanics.
-- `src/environments.py`: explicit single- and two-dealer environments.
-- `src/baselines.py`: random and persistent policies with `act(observation)`.
-- `src/networks.py` and `src/ppo.py`: custom actor-critic PPO with GAE, clipping, entropy, minibatches, and gradient clipping.
-- `src/evaluation.py`: performance and policy-behavior evaluation plus plots.
-- `notebooks/analysis.ipynb`: imports the modules and reads experiment outputs; it contains no simulator or PPO implementation.
+### Analytical best response
 
-## Replication notes
+Ganesh et al. Theorem 1 gives epsilon `0` against `Uniform[-1,1]` and the supremum `0.5-` against a deterministic competitor quoting `0.5`.
 
-This pass preserves the notebooks' Gaussian-sampling-plus-clipping action approach. A TODO in `src/networks.py` marks it for the next PPO correctness pass. The original two-agent inventory sign arithmetic is also retained and documented in the environment instead of being silently changed. Persistent-competitor convergence may remain unstable, as reported in the original work.
+At the current 20-rollout budget, five-seed random-competitor sampled means average `0.073` bid and `0.129` ask, but seed-to-seed variation is large and sampled epsilon standard deviations are about `0.61-0.62`. The policy is therefore near the analytical region on average but does **not** reliably concentrate there.
 
-No generic N-agent simulator, external RL library, experiment tracker, or configuration framework is included.
+Against the persistent competitor, sampled means average `0.026` bid and `0.054` ask with about `0.62` standard deviation and `0.677` market share. A spread-only diagnostic gives `-0.031` bid, `-0.055` ask, and `0.735` market share. Extending one spread-only seed tenfold reduces latent standard deviation to about `0.72`, but still yields sampled means near zero and `0.773` market share.
+
+This behavior is explained by the policy class and routing discontinuity. With a nonzero-variance tanh-Gaussian, maximizing expected spread PnL requires quoting well below `0.5` to avoid losing trades in the upper tail. The numerical response curve shows that at latent standard deviation `0.72` the stochastic optimum is near zero; `0.5-` is recovered only as variance approaches zero. PPO is therefore close to the stochastic-policy optimum in the spread-only case, even though it misses the deterministic theorem benchmark.
+
+### Inventory-dependent skewing
+
+The five-seed inventory-conditional plots do not reproduce robust economically signed skewing. The random-competitor aggregate tends to skew in the opposite direction, and the persistent/spread-only curves are weak. This is a negative replication result, not evidence of the paper's internalization behavior.
+
+### Risk aversion
+
+Using the current-step `-alpha * InventoryPnL^2` penalty with `alpha=0.01` reduces mean inventory standard deviation from `19.31` to `18.62` and inventory-PnL standard deviation from `4.81` to `4.55` across three paired seeds. Mean total PnL does not fall in this small sample (`110.83` versus `117.91`), but three seeds are insufficient to claim a return improvement. The supported conclusion is a modest risk reduction at the chosen coefficient.
+
+## Known differences from Ganesh et al.
+
+- Gamma-distributed order sizes remain the default; paper-style unit orders are available through `order_size_mode="unit"` and are used in the investor-flow A/B.
+- A deterministic size-based reference-spread curve instead of a calibrated stochastic spread model.
+- GBM parameters and scaling inherited from the project rather than the paper's exact setup.
+- A five-component partial observation rather than the paper's richer trade-flow and market-share inputs.
+- Custom PPO rather than RLlib PPO.
+- Exactly one competitor; adaptive market makers are intentionally out of scope.
+
+These are behavioral replication experiments, not an exact numerical reproduction.
+
+## Known limitations
+
+- Winner-take-all routing creates a discontinuous objective against persistent quotes.
+- Policy variance remains high at the short default budget.
+- Learned quote skew is not robust or correctly signed.
+- Reference spreads and investor flow are deliberately simplified.
+- Only random and persistent competitors are implemented.
+
+## Repository layout
+
+- `src/`: configuration, market mechanics, environments, baselines, network, PPO, and evaluation.
+- `experiments/`: core runs plus correctness and replication diagnostics.
+- `docs/correctness_audit.md`: timing, accounting, sign, and PPO audit.
+- `notebooks/analysis.ipynb`: analysis-only notebook; no duplicate simulator or PPO code.
+- `results/`: before/after baselines, multi-seed metrics, analytical response, and risk results.
+- `archive/`: untouched original notebook, report, and paper.
