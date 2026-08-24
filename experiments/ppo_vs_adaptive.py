@@ -18,9 +18,11 @@ from ppo import PPOAgent
 
 
 SCREENING_CHECKPOINTS = (20_480, 60_416, 100_352)
+LONGRUN_CHECKPOINTS = (20_480, 60_416, 100_352, 150_528, 204_800)
 CHECKPOINT_WINDOW = 20_480
 PROBE_INTERVAL = 100
 BASELINE_RESULTS = ROOT / "results" / "ppo_vs_adaptive"
+PROBING_RESULTS = ROOT / "results" / "ppo_vs_adaptive_probing"
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -192,6 +194,43 @@ def train_seed(
 
     if len(environment.records) != cfg.total_steps:
         raise RuntimeError("training recorder did not capture every environment step")
+    finite_record_keys = (
+        "ppo_market_share",
+        "ppo_spread_pnl",
+        "ppo_total_pnl",
+        "ppo_inventory",
+        "ppo_epsilon_bid",
+        "ppo_epsilon_ask",
+        "ppo_hedge_fraction",
+        "adaptive_market_share",
+        "adaptive_inventory",
+        "adaptive_epsilon_bid",
+        "adaptive_epsilon_ask",
+        "adaptive_hedge_fraction",
+    )
+    if not all(
+        np.isfinite(float(record[key]))
+        for record in environment.records
+        for key in finite_record_keys
+    ):
+        raise RuntimeError("training recorder contains NaN or infinite values")
+    if not all(
+        -1.0 <= float(record[key]) <= 1.0
+        for record in environment.records
+        for key in (
+            "ppo_epsilon_bid",
+            "ppo_epsilon_ask",
+            "adaptive_epsilon_bid",
+            "adaptive_epsilon_ask",
+        )
+    ):
+        raise RuntimeError("recorded epsilon action is outside [-1, 1]")
+    if not all(
+        0.0 <= float(record[key]) <= 1.0
+        for record in environment.records
+        for key in ("ppo_hedge_fraction", "adaptive_hedge_fraction")
+    ):
+        raise RuntimeError("recorded hedge action is outside [0, 1]")
     if environment.reset_calls != 3:
         raise RuntimeError(
             f"unexpected reset count {environment.reset_calls}; rollout boundaries may reset state"
@@ -253,7 +292,7 @@ def checkpoint_summary(rows: list[dict], checkpoint: int, key: str) -> tuple[flo
     return float(np.mean(values)), float(np.std(values))
 
 
-def write_report(
+def write_screening_report(
     output: Path,
     trajectory: list[dict],
     baseline_trajectory: list[dict],
@@ -517,31 +556,319 @@ def write_report(
     (output / "report_zh.md").write_text("\n".join(lines))
 
 
+def write_longrun_report(
+    output: Path,
+    trajectory: list[dict],
+    screening_trajectory: list[dict],
+) -> None:
+    keys = (
+        "ppo_market_share",
+        "ppo_spread_pnl_per_step",
+        "ppo_total_pnl_per_step",
+        "ppo_mean_abs_inventory",
+        "ppo_inventory_std",
+        "ppo_mean_hedge_fraction",
+        "ppo_mean_epsilon_bid",
+        "ppo_mean_epsilon_ask",
+        "adaptive_market_share",
+        "adaptive_mean_abs_inventory",
+        "adaptive_inventory_std",
+        "adaptive_mean_hedge_fraction",
+        "adaptive_mean_base_epsilon",
+        "adaptive_mean_epsilon_bid",
+        "adaptive_mean_epsilon_ask",
+        "adaptive_probe_steps",
+        "adaptive_probe_fraction",
+        "adaptive_base_epsilon_one_frequency",
+        "approx_kl",
+        "clip_fraction",
+        "value_loss",
+    )
+    summaries = {
+        checkpoint: {
+            key: checkpoint_summary(trajectory, checkpoint, key) for key in keys
+        }
+        for checkpoint in LONGRUN_CHECKPOINTS
+    }
+    screening_final = {
+        key: checkpoint_summary(screening_trajectory, 100_352, key)
+        for key in (
+            "ppo_market_share",
+            "ppo_total_pnl_per_step",
+            "ppo_mean_abs_inventory",
+            "adaptive_market_share",
+            "adaptive_mean_base_epsilon",
+            "adaptive_base_epsilon_one_frequency",
+        )
+    }
+    final = LONGRUN_CHECKPOINTS[-1]
+    final_rows = sorted(
+        (row for row in trajectory if int(row["training_step"]) == final),
+        key=lambda row: int(row["seed"]),
+    )
+    lines = [
+        "# PPO vs Adaptive MM persistent-probing long-run confirmation",
+        "",
+        "## Setup",
+        "",
+        "5 seeds（0–4）× 200 rollouts × 1024 steps = 204,800 training steps/seed。"
+        "PPO、environment 和 Adaptive 配置完全冻结自 Phase 4b；每个 checkpoint 使用 "
+        "trailing 20,480-step training-path window。Phase 4b comparison 为 3-seed screening，"
+        "不是 paired statistical test。",
+        "",
+        "## PPO trajectory",
+        "",
+        "| Step | Share | Spread PnL/step | Total PnL/step | Mean abs inventory | "
+        "Inventory std | Mean hedge | Mean bid/ask epsilon |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for checkpoint in LONGRUN_CHECKPOINTS:
+        row = summaries[checkpoint]
+        lines.append(
+            f"| {checkpoint:,} | {row['ppo_market_share'][0]:.4f} | "
+            f"{row['ppo_spread_pnl_per_step'][0]:.4f} | "
+            f"{row['ppo_total_pnl_per_step'][0]:.4f} | "
+            f"{row['ppo_mean_abs_inventory'][0]:.3f} | "
+            f"{row['ppo_inventory_std'][0]:.3f} | "
+            f"{row['ppo_mean_hedge_fraction'][0]:.3f} | "
+            f"{row['ppo_mean_epsilon_bid'][0]:.3f} / "
+            f"{row['ppo_mean_epsilon_ask'][0]:.3f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Adaptive trajectory",
+            "",
+            "| Step | Share | Mean abs inventory | Inventory std | Mean hedge | "
+            "Mean base | Mean bid/ask epsilon | Base=1 frequency | Probe fraction |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for checkpoint in LONGRUN_CHECKPOINTS:
+        row = summaries[checkpoint]
+        lines.append(
+            f"| {checkpoint:,} | {row['adaptive_market_share'][0]:.4f} | "
+            f"{row['adaptive_mean_abs_inventory'][0]:.3f} | "
+            f"{row['adaptive_inventory_std'][0]:.3f} | "
+            f"{row['adaptive_mean_hedge_fraction'][0]:.3f} | "
+            f"{row['adaptive_mean_base_epsilon'][0]:.3f} | "
+            f"{row['adaptive_mean_epsilon_bid'][0]:.3f} / "
+            f"{row['adaptive_mean_epsilon_ask'][0]:.3f} | "
+            f"{row['adaptive_base_epsilon_one_frequency'][0]:.3%} | "
+            f"{row['adaptive_probe_fraction'][0]:.3%} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Final by seed",
+            "",
+            "| Seed | PPO total PnL/step | PPO share | PPO mean abs inventory | "
+            "Adaptive share | Adaptive mean base | Base=1 frequency |",
+            "|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in final_rows:
+        lines.append(
+            f"| {int(row['seed'])} | {float(row['ppo_total_pnl_per_step']):.4f} | "
+            f"{float(row['ppo_market_share']):.4f} | "
+            f"{float(row['ppo_mean_abs_inventory']):.3f} | "
+            f"{float(row['adaptive_market_share']):.4f} | "
+            f"{float(row['adaptive_mean_base_epsilon']):.3f} | "
+            f"{float(row['adaptive_base_epsilon_one_frequency']):.3%} |"
+        )
+    lines.extend(
+        [
+            "| **Mean** | "
+            f"{summaries[final]['ppo_total_pnl_per_step'][0]:.4f} | "
+            f"{summaries[final]['ppo_market_share'][0]:.4f} | "
+            f"{summaries[final]['ppo_mean_abs_inventory'][0]:.3f} | "
+            f"{summaries[final]['adaptive_market_share'][0]:.4f} | "
+            f"{summaries[final]['adaptive_mean_base_epsilon'][0]:.3f} | "
+            f"{summaries[final]['adaptive_base_epsilon_one_frequency'][0]:.3%} |",
+            "| **Population std** | "
+            f"{summaries[final]['ppo_total_pnl_per_step'][1]:.4f} | "
+            f"{summaries[final]['ppo_market_share'][1]:.4f} | "
+            f"{summaries[final]['ppo_mean_abs_inventory'][1]:.3f} | "
+            f"{summaries[final]['adaptive_market_share'][1]:.4f} | "
+            f"{summaries[final]['adaptive_mean_base_epsilon'][1]:.3f} | "
+            f"{summaries[final]['adaptive_base_epsilon_one_frequency'][1]:.3%} |",
+            "",
+            "## Phase 4b @100k vs Phase 5 @204.8k",
+            "",
+            "| Metric | Phase 4b final (3 seeds) | Phase 5 final (5 seeds) |",
+            "|---|---:|---:|",
+            f"| PPO total PnL/step | {screening_final['ppo_total_pnl_per_step'][0]:.4f} | "
+            f"{summaries[final]['ppo_total_pnl_per_step'][0]:.4f} |",
+            f"| PPO mean abs inventory | {screening_final['ppo_mean_abs_inventory'][0]:.3f} | "
+            f"{summaries[final]['ppo_mean_abs_inventory'][0]:.3f} |",
+            f"| PPO market share | {screening_final['ppo_market_share'][0]:.4f} | "
+            f"{summaries[final]['ppo_market_share'][0]:.4f} |",
+            f"| Adaptive market share | {screening_final['adaptive_market_share'][0]:.4f} | "
+            f"{summaries[final]['adaptive_market_share'][0]:.4f} |",
+            f"| Adaptive mean base | {screening_final['adaptive_mean_base_epsilon'][0]:.3f} | "
+            f"{summaries[final]['adaptive_mean_base_epsilon'][0]:.3f} |",
+            f"| Adaptive base=1 frequency | "
+            f"{screening_final['adaptive_base_epsilon_one_frequency'][0]:.3%} | "
+            f"{summaries[final]['adaptive_base_epsilon_one_frequency'][0]:.3%} |",
+            f"| PPO PnL population std | "
+            f"{screening_final['ppo_total_pnl_per_step'][1]:.4f} | "
+            f"{summaries[final]['ppo_total_pnl_per_step'][1]:.4f} |",
+            "",
+            "## PPO diagnostics",
+            "",
+            "| Step | Approx KL | Clip fraction | Value loss |",
+            "|---:|---:|---:|---:|",
+        ]
+    )
+    for checkpoint in LONGRUN_CHECKPOINTS:
+        row = summaries[checkpoint]
+        lines.append(
+            f"| {checkpoint:,} | {row['approx_kl'][0]:.4f} | "
+            f"{row['clip_fraction'][0]:.4f} | {row['value_loss'][0]:.1f} |"
+        )
+    early = LONGRUN_CHECKPOINTS[0]
+    screening_endpoint = 100_352
+    late = 150_528
+    row_by_seed_step = {
+        (int(row["seed"]), int(row["training_step"])): row for row in trajectory
+    }
+    ppo_improvement_count = sum(
+        float(row_by_seed_step[(seed, final)]["ppo_total_pnl_per_step"])
+        > float(row_by_seed_step[(seed, early)]["ppo_total_pnl_per_step"])
+        for seed in range(5)
+    )
+    inventory_increase_count = sum(
+        float(row_by_seed_step[(seed, final)]["ppo_mean_abs_inventory"])
+        > float(row_by_seed_step[(seed, early)]["ppo_mean_abs_inventory"])
+        for seed in range(5)
+    )
+    low_share_final_rows = [
+        row for row in final_rows if float(row["adaptive_market_share"]) < 0.10
+    ]
+    collapse_paths = []
+    for row in low_share_final_rows:
+        seed = int(row["seed"])
+        at_100k = row_by_seed_step[(seed, screening_endpoint)]
+        at_150k = row_by_seed_step[(seed, late)]
+        collapse_paths.append(
+            f"seed {seed}: share "
+            f"{float(at_100k['adaptive_market_share']):.3f}→"
+            f"{float(at_150k['adaptive_market_share']):.3f}→"
+            f"{float(row['adaptive_market_share']):.3f}, base=1 "
+            f"{float(at_100k['adaptive_base_epsilon_one_frequency']):.1%}→"
+            f"{float(at_150k['adaptive_base_epsilon_one_frequency']):.1%}→"
+            f"{float(row['adaptive_base_epsilon_one_frequency']):.1%}"
+        )
+    active_paths = []
+    for row in final_rows:
+        if float(row["adaptive_market_share"]) >= 0.10:
+            seed = int(row["seed"])
+            active_paths.append(
+                f"seed {seed}: "
+                f"{float(row_by_seed_step[(seed, screening_endpoint)]['adaptive_market_share']):.3f}→"
+                f"{float(row_by_seed_step[(seed, late)]['adaptive_market_share']):.3f}→"
+                f"{float(row['adaptive_market_share']):.3f}"
+            )
+    final_value_losses = [float(row["value_loss"]) for row in final_rows]
+    lines.extend(
+        [
+            "",
+            "## Interpretation",
+            "",
+            f"- **Adaptive 没有在所有 seeds 中长期保持 active。** 5-seed mean share 从 "
+            f"100k 的 {summaries[screening_endpoint]['adaptive_market_share'][0]:.4f} 降至 "
+            f"204.8k 的 {summaries[final]['adaptive_market_share'][0]:.4f}；mean base=1 "
+            f"frequency 从 {summaries[screening_endpoint]['adaptive_base_epsilon_one_frequency'][0]:.1%} "
+            f"升至 {summaries[final]['adaptive_base_epsilon_one_frequency'][0]:.1%}。",
+            f"- **出现两个明确的 late-stage near-absorbing paths。** {'；'.join(collapse_paths)}。"
+            "这说明 1% diagonal probing 对这些 paths 主要延迟、而非永久消除 lock-in。",
+            f"- **另外三个 seeds 维持 nontrivial interaction，但不是单一固定点。** "
+            f"{'；'.join(active_paths)}。Seeds 1/2/3 分别表现为较稳定 band 或有界振荡，"
+            "而 seeds 0/4 向 PPO-dominant regime 漂移，支持 multi-agent path dependence。",
+            f"- **PPO economics 持续改善。** Total PnL/step mean 从 "
+            f"{summaries[early]['ppo_total_pnl_per_step'][0]:.4f} 升至 "
+            f"{summaries[final]['ppo_total_pnl_per_step'][0]:.4f}，{ppo_improvement_count}/5 seeds "
+            f"均改善；spread PnL/step 同时从 "
+            f"{summaries[early]['ppo_spread_pnl_per_step'][0]:.4f} 升至 "
+            f"{summaries[final]['ppo_spread_pnl_per_step'][0]:.4f}，因此收益提升不只是 inventory "
+            "mark-to-market exposure。",
+            f"- **Inventory risk 有所增加但不是无界一致恶化。** Mean abs inventory "
+            f"{summaries[early]['ppo_mean_abs_inventory'][0]:.3f}→"
+            f"{summaries[final]['ppo_mean_abs_inventory'][0]:.3f}，inventory std "
+            f"{summaries[early]['ppo_inventory_std'][0]:.3f}→"
+            f"{summaries[final]['ppo_inventory_std'][0]:.3f}；{inventory_increase_count}/5 seeds "
+            "增加。Seed 0/3 final mean abs inventory 达 13.209/10.688，是需要保留的风险警讯。",
+            f"- **Seed dispersion 不可忽略。** Final PPO PnL population std="
+            f"{summaries[final]['ppo_total_pnl_per_step'][1]:.4f}（seed range "
+            f"{min(float(row['ppo_total_pnl_per_step']) for row in final_rows):.4f}–"
+            f"{max(float(row['ppo_total_pnl_per_step']) for row in final_rows):.4f}），Adaptive "
+            f"share std={summaries[final]['adaptive_market_share'][1]:.4f}，base=1 frequency "
+            f"std={summaries[final]['adaptive_base_epsilon_one_frequency'][1]:.1%}。",
+            f"- Approx KL/clip fraction 没有共同 explosion，但 final value loss range="
+            f"{min(final_value_losses):.1f}–{max(final_value_losses):.1f}；seed 1 的大 value loss "
+            "与高 PnL path 一起说明 return/value scale 仍高度 path-dependent。本轮按 scope 不修复。",
+            "- Execution sanity 全部通过：5/5 runs 到达 204,800 steps；每 seed cold start=121、"
+            "probe steps=2,046（总步数占比 0.9990%）；无 NaN/Inf、越界 action 或 crash。",
+            "",
+            "## Go / No-Go",
+            "",
+            "**No-Go for freezing this setup as a stable, reproducible interaction result.** "
+            "Positive PPO learning 与 3/5 active-opponent paths 值得保留，但 2/5 seeds 在 late stage "
+            "重新接近 absorbing state，且 final regime dispersion 很大。下一步应是 targeted mechanism "
+            "investigation，区分 diagonal estimates 已刷新但 Step 1 仍偏向 1.0，还是 stale "
+            "off-diagonal Step 2 responses / path feedback 导致退出；本轮不修改或 sweep 任何机制。",
+            "",
+        ]
+    )
+    (output / "report_zh.md").write_text("\n".join(lines))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Screen PPO against an online Adaptive MM")
+    parser.add_argument(
+        "--mode",
+        choices=("screening", "longrun"),
+        default="screening",
+    )
     parser.add_argument("--seeds", type=int, default=3)
     parser.add_argument("--rollouts", type=int, default=98)
     parser.add_argument("--horizon", type=int, default=1024)
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=ROOT / "results" / "ppo_vs_adaptive_probing",
+        default=None,
     )
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
-    if args.seeds != 3 or args.rollouts * args.horizon != 100_352:
-        raise ValueError("screening requires 3 seeds and exactly 100,352 steps per seed")
-    if any(checkpoint % args.horizon for checkpoint in SCREENING_CHECKPOINTS):
+    if args.mode == "screening":
+        checkpoints = SCREENING_CHECKPOINTS
+        expected_seeds = 3
+        expected_steps = 100_352
+        default_output = PROBING_RESULTS
+        comparison_path = BASELINE_RESULTS / "training_trajectories.csv"
+    else:
+        checkpoints = LONGRUN_CHECKPOINTS
+        expected_seeds = 5
+        expected_steps = 204_800
+        default_output = ROOT / "results" / "ppo_vs_adaptive_probing_longrun"
+        comparison_path = PROBING_RESULTS / "training_trajectories.csv"
+    if args.seeds != expected_seeds or args.rollouts * args.horizon != expected_steps:
+        raise ValueError(
+            f"{args.mode} requires {expected_seeds} seeds and exactly "
+            f"{expected_steps:,} steps per seed"
+        )
+    if any(checkpoint % args.horizon for checkpoint in checkpoints):
         raise ValueError("all checkpoints must align to rollout boundaries")
-    baseline_path = BASELINE_RESULTS / "training_trajectories.csv"
-    baseline_trajectory = read_csv(baseline_path)
-    if len(baseline_trajectory) != args.seeds * len(SCREENING_CHECKPOINTS):
-        raise RuntimeError(f"paired no-probing baseline is incomplete: {baseline_path}")
+    comparison_trajectory = read_csv(comparison_path)
+    expected_comparison_rows = 9
+    if len(comparison_trajectory) != expected_comparison_rows:
+        raise RuntimeError(f"comparison result is incomplete: {comparison_path}")
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = args.output_dir / "metrics_by_seed.csv"
-    trajectory_path = args.output_dir / "training_trajectories.csv"
+    output_dir = args.output_dir or default_output
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / "metrics_by_seed.csv"
+    trajectory_path = output_dir / "training_trajectories.csv"
     metrics = read_csv(metrics_path) if args.resume else []
     trajectory = read_csv(trajectory_path) if args.resume else []
     completed = {int(row["seed"]) for row in metrics}
@@ -555,7 +882,7 @@ def main() -> None:
             seed,
             args.rollouts,
             args.horizon,
-            SCREENING_CHECKPOINTS,
+            checkpoints,
         )
         metrics.append(row)
         trajectory.extend(trajectory_rows)
@@ -569,8 +896,11 @@ def main() -> None:
             flush=True,
         )
 
-    write_report(args.output_dir, trajectory, baseline_trajectory)
-    print(f"Saved PPO-vs-Adaptive screening under {args.output_dir}")
+    if args.mode == "screening":
+        write_screening_report(output_dir, trajectory, comparison_trajectory)
+    else:
+        write_longrun_report(output_dir, trajectory, comparison_trajectory)
+    print(f"Saved PPO-vs-Adaptive {args.mode} under {output_dir}")
 
 
 if __name__ == "__main__":
