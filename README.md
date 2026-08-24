@@ -12,6 +12,10 @@ The strongest result so far is that **state-dependent policy variance** substant
 
 This repository is a **behavioral replication and RL investigation**, not an exact numerical reproduction of the original paper.
 
+The pure, environment-independent Adaptive Market Maker Phase 1 decision logic
+and its documented interpretation choices are described in
+[`docs/adaptive_market_maker.md`](docs/adaptive_market_maker.md).
+
 ---
 
 ## Key findings
