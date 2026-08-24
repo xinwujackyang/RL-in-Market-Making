@@ -295,6 +295,41 @@ def aggregate_checkpoint(
     }
 
 
+def aggregate_frozen_checkpoint(
+    seed: int,
+    checkpoint: int,
+    records: list[dict],
+) -> dict:
+    start = max(0, checkpoint - CHECKPOINT_WINDOW)
+    window = records[start:checkpoint]
+    adaptive_base = np.asarray(
+        [row["adaptive_base_epsilon"] for row in window], dtype=float
+    )
+    normal_adaptive_base = np.asarray(
+        [
+            row["adaptive_base_epsilon"]
+            for row in window
+            if not row["adaptive_cold_start"] and not row["adaptive_probe"]
+        ],
+        dtype=float,
+    )
+    ppo_inventory = np.asarray([row["ppo_inventory"] for row in window], dtype=float)
+    return {
+        "seed": seed,
+        "training_step": checkpoint,
+        "window_start": start + 1,
+        "window_steps": len(window),
+        "adaptive_market_share": mean(window, "adaptive_market_share"),
+        "adaptive_mean_base_epsilon": float(np.nanmean(adaptive_base)),
+        "adaptive_base_epsilon_one_frequency": float(
+            np.isclose(normal_adaptive_base, 1.0, rtol=0.0, atol=1e-6).mean()
+        ),
+        "ppo_market_share": mean(window, "ppo_market_share"),
+        "ppo_total_pnl_per_step": mean(window, "ppo_total_pnl"),
+        "ppo_mean_abs_inventory": float(np.abs(ppo_inventory).mean()),
+    }
+
+
 def validate_training_run(
     environment: RecordingAdaptiveEnv,
     adaptive: AdaptiveMarketMakerCompetitor,
@@ -504,6 +539,89 @@ def train_calibrated_seed(
     return metrics, trajectory_rows
 
 
+def run_calibrated_frozen_seed(
+    seed: int,
+    rollouts: int,
+    horizon: int,
+    checkpoints: tuple[int, ...],
+) -> tuple[dict, list[dict]]:
+    cfg = make_config(seed, rollouts, horizon)
+    agent, calibrated_statistics, calibration = initialize_and_calibrate(cfg, seed)
+    adaptive = AdaptiveMarketMakerCompetitor(
+        market_share_target=0.5,
+        risk_aversion=2.0,
+        probe_interval=PROBE_INTERVAL,
+        initial_response_statistics=calibrated_statistics,
+    )
+    environment = RecordingAdaptiveEnv(
+        adaptive,
+        cfg,
+        seed=seed * 100_000 + 10_000,
+        reward_mode="total",
+        initial_previous_market_volume=float(cfg.num_investors),
+    )
+    if (
+        environment.price != cfg.P0
+        or environment.inventory != [0.0, 0.0]
+        or environment.t != 0
+    ):
+        raise RuntimeError("frozen formal environment is not fresh")
+    agent.env = environment
+    frozen_parameters = {
+        name: parameter.detach().clone()
+        for name, parameter in agent.network.named_parameters()
+    }
+
+    observation = environment.reset()
+    for _ in range(cfg.total_steps):
+        ppo_action = agent.sample_action(observation)
+        observation, _, _, _ = environment.step(ppo_action)
+
+    parameter_max_abs_change = max(
+        float(
+            (parameter.detach() - frozen_parameters[name])
+            .abs()
+            .max()
+            .cpu()
+            .item()
+        )
+        for name, parameter in agent.network.named_parameters()
+    )
+    if parameter_max_abs_change != 0.0:
+        raise RuntimeError("frozen PPO parameters changed during formal phase")
+    if agent.optimizer.state:
+        raise RuntimeError("frozen PPO optimizer state changed during formal phase")
+    if agent.buffer.pointer != 0 or agent.buffer.path_start != 0:
+        raise RuntimeError("frozen formal loop touched the PPO rollout buffer")
+    if agent.history.steps or agent.history.rewards or agent.history.diagnostics:
+        raise RuntimeError("frozen formal loop created PPO training history")
+    cold_start_steps, probe_steps = validate_training_run(
+        environment,
+        adaptive,
+        cfg,
+        expected_reset_calls=2,
+        expected_cold_start_steps=0,
+    )
+    trajectory_rows = [
+        aggregate_frozen_checkpoint(seed, checkpoint, environment.records)
+        for checkpoint in checkpoints
+    ]
+    final = trajectory_rows[-1]
+    metrics = {
+        "seed": seed,
+        "formal_steps": cfg.total_steps,
+        **calibration,
+        "formal_cold_start_steps": cold_start_steps,
+        "adaptive_probe_steps_total": probe_steps,
+        "frozen_ppo_parameter_max_abs_change": parameter_max_abs_change,
+        "frozen_optimizer_state_entries": len(agent.optimizer.state),
+        "frozen_rollout_buffer_pointer": agent.buffer.pointer,
+        "frozen_training_history_steps": len(agent.history.steps),
+        **{key: value for key, value in final.items() if key != "seed"},
+    }
+    return metrics, trajectory_rows
+
+
 def checkpoint_summary(rows: list[dict], checkpoint: int, key: str) -> tuple[float, float]:
     values = [
         float(row[key])
@@ -511,6 +629,101 @@ def checkpoint_summary(rows: list[dict], checkpoint: int, key: str) -> tuple[flo
         if int(row["training_step"]) == checkpoint
     ]
     return float(np.mean(values)), float(np.std(values))
+
+
+def write_calibrated_frozen_report(
+    output: Path,
+    trajectory: list[dict],
+    learning_trajectory: list[dict],
+) -> None:
+    frozen = {
+        checkpoint: {
+            key: checkpoint_summary(trajectory, checkpoint, key)
+            for key in (
+                "adaptive_market_share",
+                "adaptive_mean_base_epsilon",
+                "adaptive_base_epsilon_one_frequency",
+                "ppo_market_share",
+                "ppo_total_pnl_per_step",
+                "ppo_mean_abs_inventory",
+            )
+        }
+        for checkpoint in SCREENING_CHECKPOINTS
+    }
+    final = SCREENING_CHECKPOINTS[-1]
+    learning_final = {
+        int(row["seed"]): row
+        for row in learning_trajectory
+        if int(row["training_step"]) == final
+    }
+    frozen_final = {
+        int(row["seed"]): row
+        for row in trajectory
+        if int(row["training_step"]) == final
+    }
+    lines = [
+        "# Frozen PPO vs calibrated Adaptive MM",
+        "",
+        "## Setup",
+        "",
+        "每 seed 先按 Phase 6 执行 10 x 121 = 1,210 calibration steps，再在 fresh formal "
+        "environment 中以同一个随机初始化 theta0 stochastic policy 手写运行 100,352 steps。Formal "
+        "phase 不调用 `train()`、optimizer、rollout buffer、GAE 或 PPO loss；Adaptive 参数、warm-start "
+        "table、interval=100 diagonal probing 均与 Phase 6 相同。Checkpoint 指标统计此前 20,480 steps。",
+        "",
+        "## Frozen trajectories",
+        "",
+        "| Step | Adaptive share | Adaptive mean base | Adaptive base=1 | PPO share | "
+        "PPO total PnL/step | PPO mean abs inventory |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for checkpoint in SCREENING_CHECKPOINTS:
+        row = frozen[checkpoint]
+        lines.append(
+            f"| {checkpoint:,} | {row['adaptive_market_share'][0]:.4f} | "
+            f"{row['adaptive_mean_base_epsilon'][0]:.3f} | "
+            f"{row['adaptive_base_epsilon_one_frequency'][0]:.3%} | "
+            f"{row['ppo_market_share'][0]:.4f} | "
+            f"{row['ppo_total_pnl_per_step'][0]:.4f} | "
+            f"{row['ppo_mean_abs_inventory'][0]:.3f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Learning vs frozen: final matched comparison",
+            "",
+            "| Seed | Learning PPO final Adaptive share | Frozen PPO final Adaptive share | "
+            "Learning base=1 | Frozen base=1 |",
+            "|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for seed in range(3):
+        learning = learning_final[seed]
+        frozen_row = frozen_final[seed]
+        lines.append(
+            f"| {seed} | {float(learning['adaptive_market_share']):.4f} | "
+            f"{float(frozen_row['adaptive_market_share']):.4f} | "
+            f"{float(learning['adaptive_base_epsilon_one_frequency']):.3%} | "
+            f"{float(frozen_row['adaptive_base_epsilon_one_frequency']):.3%} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Conclusion",
+            "",
+            "**PPO nonstationarity 是主要问题。** Frozen theta0 的三个 seed 在全部 checkpoints "
+            "中，Adaptive share 保持在 0.296–0.482，base=1 frequency 保持在 24.1%–50.5%；"
+            "没有出现随时间单向 drift 到 share≈0 / base=1≈100% 的 lock-in。相比之下，learning "
+            "PPO 的 seed 1 final Adaptive share=0.114、base=1=86.0%，seed 0 也明显弱于 matched "
+            "frozen run。Seed 2 的 frozen result 略弱于 learning result，说明 path dispersion "
+            "没有消失，但结果不支持 Adaptive 自身 dynamics 单独造成此前的极端退出态。",
+            "",
+            "PPO formal parameter max change 对全部 seed 均为 0；optimizer state、rollout buffer "
+            "pointer 与 training history 也保持为空。",
+            "",
+        ]
+    )
+    (output / "report_zh.md").write_text("\n".join(lines))
 
 
 def write_screening_report(
@@ -1299,7 +1512,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Screen PPO against an online Adaptive MM")
     parser.add_argument(
         "--mode",
-        choices=("screening", "calibrated", "longrun"),
+        choices=("screening", "calibrated", "calibrated_frozen", "longrun"),
         default="screening",
     )
     parser.add_argument("--seeds", type=int, default=3)
@@ -1325,6 +1538,14 @@ def main() -> None:
         expected_steps = 100_352
         default_output = ROOT / "results" / "ppo_vs_adaptive_calibrated"
         comparison_path = PROBING_RESULTS / "training_trajectories.csv"
+    elif args.mode == "calibrated_frozen":
+        checkpoints = SCREENING_CHECKPOINTS
+        expected_seeds = 3
+        expected_steps = 100_352
+        default_output = ROOT / "results" / "ppo_vs_adaptive_calibrated_frozen"
+        comparison_path = (
+            ROOT / "results" / "ppo_vs_adaptive_calibrated" / "training_trajectories.csv"
+        )
     else:
         checkpoints = LONGRUN_CHECKPOINTS
         expected_seeds = 5
@@ -1355,10 +1576,13 @@ def main() -> None:
         if seed in completed:
             print(f"Skipping completed seed={seed}", flush=True)
             continue
-        print(f"Training PPO vs Adaptive seed={seed}", flush=True)
-        training_function = (
-            train_calibrated_seed if args.mode == "calibrated" else train_seed
-        )
+        print(f"Running PPO vs Adaptive seed={seed} mode={args.mode}", flush=True)
+        if args.mode == "calibrated":
+            training_function = train_calibrated_seed
+        elif args.mode == "calibrated_frozen":
+            training_function = run_calibrated_frozen_seed
+        else:
+            training_function = train_seed
         row, trajectory_rows = training_function(
             seed,
             args.rollouts,
@@ -1377,7 +1601,7 @@ def main() -> None:
             + (
                 f" calibration={row['calibration_steps']} cold_start="
                 f"{row['formal_cold_start_steps']}"
-                if args.mode == "calibrated"
+                if args.mode in ("calibrated", "calibrated_frozen")
                 else ""
             ),
             flush=True,
@@ -1387,6 +1611,8 @@ def main() -> None:
         write_screening_report(output_dir, trajectory, comparison_trajectory)
     elif args.mode == "calibrated":
         write_calibrated_report(output_dir, trajectory, comparison_trajectory)
+    elif args.mode == "calibrated_frozen":
+        write_calibrated_frozen_report(output_dir, trajectory, comparison_trajectory)
     else:
         write_longrun_report(output_dir, trajectory, comparison_trajectory)
     print(f"Saved PPO-vs-Adaptive {args.mode} under {output_dir}")
