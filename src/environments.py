@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from config import Config
@@ -124,6 +126,9 @@ class TwoDealerMarketEnv:
         self.reset()
 
     def reset(self) -> np.ndarray:
+        reset_hook = getattr(self.competitor, "reset_adaptive_state", None)
+        if reset_hook is not None:
+            reset_hook()
         self.price = self.cfg.P0
         self.inventory = [0.0, 0.0]
         self.last_pnl = [PnL(), PnL()]
@@ -134,6 +139,7 @@ class TwoDealerMarketEnv:
             (2, self.cfg.num_investors), dtype=np.float32
         )
         self.previous_market_share = [0.0, 0.0]
+        self.previous_market_volume = 0.0
         self.t = 0
         return self._observation(0)
 
@@ -171,9 +177,29 @@ class TwoDealerMarketEnv:
         return np.array(observation, dtype=np.float32)
 
     def step(self, rl_action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
-        actions = [_clip_action(rl_action), _clip_action(self.competitor.act(self._observation(1)))]
+        decision_price = self.price
+        competitor_inventory_before_action = self.inventory[1]
+        reference_spread_at_zero = reference_spread(decision_price, 0.0, self.cfg)
+        adaptive_action_hook = getattr(self.competitor, "act_with_market_state", None)
+        if adaptive_action_hook is None:
+            competitor_action = self.competitor.act(self._observation(1))
+        else:
+            competitor_action = adaptive_action_hook(
+                inventory=competitor_inventory_before_action,
+                price=decision_price,
+                previous_market_volume=self.previous_market_volume,
+                reference_spread_at_zero=reference_spread_at_zero,
+                normal_volatility=(
+                    self.cfg.sigma * math.sqrt(self.cfg.dt) * decision_price
+                ),
+                hedge_spread=lambda signed_size: reference_spread(
+                    decision_price, abs(signed_size), self.cfg
+                ),
+            )
+        actions = [_clip_action(rl_action), _clip_action(competitor_action)]
         spread_pnl = [0.0, 0.0]
         step_volume = [0.0, 0.0]
+        step_net_flow = [0.0, 0.0]
         step_orders = [0, 0]
         step_bid_fills = [0, 0]
         step_ask_fills = [0, 0]
@@ -213,6 +239,7 @@ class TwoDealerMarketEnv:
             spread_pnl[winner] += size * ref * (1 + epsilon)
             self.inventory[winner] += direction * size
             step_volume[winner] += size
+            step_net_flow[winner] += direction * size
             step_orders[winner] += 1
             step_trade_vectors[winner, investor] = direction
             if direction > 0:
@@ -241,6 +268,17 @@ class TwoDealerMarketEnv:
         self.last_pnl = pnls
         self.t += 1
         total_volume = sum(step_volume)
+        adaptive_outcome_hook = getattr(self.competitor, "observe_outcome", None)
+        if adaptive_outcome_hook is not None:
+            adaptive_outcome_hook(
+                epsilon_bid=float(actions[1][0]),
+                epsilon_ask=float(actions[1][1]),
+                gross_volume=step_volume[1],
+                net_flow=step_net_flow[1],
+                spread_pnl=pnls[1].spread,
+                reference_spread_at_zero=reference_spread_at_zero,
+            )
+        self.previous_market_volume = total_volume
         info = {
             "spread_pnl": pnls[0].spread,
             "inventory_pnl": pnls[0].inventory,
@@ -252,6 +290,14 @@ class TwoDealerMarketEnv:
             "competitor_inventory_pnl": pnls[1].inventory,
             "competitor_hedge_cost": pnls[1].hedge_cost,
             "competitor_inventory": self.inventory[1],
+            "competitor_inventory_before_action": competitor_inventory_before_action,
+            "competitor_decision_price": decision_price,
+            "competitor_epsilon_bid": float(actions[1][0]),
+            "competitor_epsilon_ask": float(actions[1][1]),
+            "competitor_hedge_fraction": float(actions[1][2]),
+            "competitor_gross_volume": step_volume[1],
+            "competitor_net_flow": step_net_flow[1],
+            "competitor_market_share": step_volume[1] / total_volume if total_volume else 0.0,
             "market_share": step_volume[0] / total_volume if total_volume else 0.0,
             "n_buy": investor_buy_count,
             "n_sell": investor_sell_count,
@@ -260,5 +306,10 @@ class TwoDealerMarketEnv:
             "gross_investor_volume": investor_buy_volume + investor_sell_volume,
             "net_investor_flow": investor_buy_volume - investor_sell_volume,
         }
+        if adaptive_action_hook is not None:
+            info.update(
+                competitor_base_epsilon=float(self.competitor.last_base_epsilon),
+                competitor_cold_start=bool(self.competitor.last_action_was_cold_start),
+            )
         reward = pnls[0].total if self.reward_mode == "total" else pnls[0].spread
         return self._observation(0), reward, False, info

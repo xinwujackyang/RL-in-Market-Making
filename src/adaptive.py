@@ -117,7 +117,11 @@ class AdaptiveResponseTable:
         }
 
     def _canonical_epsilon(self, epsilon: float) -> float:
-        matches = [value for value in self.epsilon_grid if math.isclose(epsilon, value, abs_tol=1e-12)]
+        matches = [
+            value
+            for value in self.epsilon_grid
+            if math.isclose(epsilon, value, rel_tol=0.0, abs_tol=1e-6)
+        ]
         if not matches:
             raise ValueError(f"epsilon {epsilon} is not on the configured grid")
         return matches[0]
@@ -202,6 +206,90 @@ class AdaptiveDecision:
         return np.array(
             [self.epsilon_bid, self.epsilon_ask, self.hedge_fraction],
             dtype=np.float32,
+        )
+
+
+class AdaptiveMarketMakerCompetitor:
+    """Minimal simulator adapter around the pure Adaptive MM decision logic."""
+
+    def __init__(
+        self,
+        market_share_target: float,
+        risk_aversion: float,
+    ) -> None:
+        self.market_share_target = float(market_share_target)
+        self.risk_aversion = float(risk_aversion)
+        self.reset_adaptive_state()
+
+    def reset_adaptive_state(self) -> None:
+        self.response_table = AdaptiveResponseTable()
+        self.market_maker = AdaptiveMarketMaker(
+            self.response_table,
+            market_share_target=self.market_share_target,
+            risk_aversion=self.risk_aversion,
+        )
+        self._cold_start_sequence = cold_start_quotes()
+        self._cold_start_index = 0
+        self.last_base_epsilon = float("nan")
+        self.last_action = np.zeros(3, dtype=np.float32)
+        self.last_action_was_cold_start = True
+
+    @property
+    def cold_start_complete(self) -> bool:
+        return self._cold_start_index >= len(self._cold_start_sequence)
+
+    def act_with_market_state(
+        self,
+        *,
+        inventory: float,
+        price: float,
+        previous_market_volume: float,
+        reference_spread_at_zero: float,
+        normal_volatility: float,
+        hedge_spread: Callable[[float], float],
+    ) -> np.ndarray:
+        del price  # Included in the hook state for diagnostics and future extensions.
+        if not self.cold_start_complete:
+            epsilon_bid, epsilon_ask = self._cold_start_sequence[self._cold_start_index]
+            self._cold_start_index += 1
+            self.last_base_epsilon = float("nan")
+            self.last_action_was_cold_start = True
+            self.last_action = np.array(
+                [epsilon_bid, epsilon_ask, 0.0], dtype=np.float32
+            )
+            return self.last_action.copy()
+
+        self.response_table.validate_complete()
+        decision = self.market_maker.decide(
+            inventory=inventory,
+            market_volume=previous_market_volume,
+            reference_spread_at_zero=reference_spread_at_zero,
+            normal_volatility=normal_volatility,
+            hedge_spread=hedge_spread,
+        )
+        self.last_base_epsilon = decision.base_epsilon
+        self.last_action_was_cold_start = False
+        self.last_action = decision.action
+        return self.last_action.copy()
+
+    def observe_outcome(
+        self,
+        *,
+        epsilon_bid: float,
+        epsilon_ask: float,
+        gross_volume: float,
+        net_flow: float,
+        spread_pnl: float,
+        reference_spread_at_zero: float,
+    ) -> None:
+        if reference_spread_at_zero <= 0.0:
+            raise ValueError("reference_spread_at_zero must be positive")
+        self.response_table.update(
+            epsilon_bid,
+            epsilon_ask,
+            gross_volume,
+            net_flow,
+            spread_pnl / reference_spread_at_zero,
         )
 
 

@@ -4,18 +4,24 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from adaptive import (
     DEFAULT_EPSILON_GRID,
+    AdaptiveMarketMakerCompetitor,
     AdaptiveMarketMaker,
     AdaptiveResponseTable,
     MissingResponseStatistics,
     ResponseStatistics,
     cold_start_quotes,
 )
+from baselines import PersistentMarketMaker
+from config import Config
+from environments import SingleDealerMarketEnv, TwoDealerMarketEnv
 
 
 def response(
@@ -207,6 +213,41 @@ class ColdStartQuoteTests(unittest.TestCase):
             for epsilon_ask in DEFAULT_EPSILON_GRID
         }
         self.assertEqual(set(quotes), expected)
+
+
+class AdaptiveSimulatorIntegrationTests(unittest.TestCase):
+    def test_single_dealer_environment_is_unchanged(self) -> None:
+        environment = SingleDealerMarketEnv(Config(order_size_mode="unit"), seed=100)
+        self.assertEqual(environment.t, 0)
+
+    def test_cold_start_completes_then_adaptive_action_runs(self) -> None:
+        adaptive = AdaptiveMarketMakerCompetitor(
+            market_share_target=0.5,
+            risk_aversion=1.0,
+        )
+        cfg = Config(order_size_mode="unit", sigma=0.0)
+        env = TwoDealerMarketEnv(adaptive, cfg, seed=101)
+        persistent_action = PersistentMarketMaker(0.5, 0.5, 0.0).act()
+
+        for _ in range(121):
+            _, _, _, info = env.step(persistent_action)
+            self.assertTrue(info["competitor_cold_start"])
+
+        self.assertTrue(adaptive.cold_start_complete)
+        adaptive.response_table.validate_complete()
+
+        _, _, _, info = env.step(persistent_action)
+        action = np.array(
+            [
+                info["competitor_epsilon_bid"],
+                info["competitor_epsilon_ask"],
+                info["competitor_hedge_fraction"],
+            ]
+        )
+        self.assertFalse(info["competitor_cold_start"])
+        self.assertTrue(np.all(action[:2] >= -1.0))
+        self.assertTrue(np.all(action[:2] <= 1.0))
+        self.assertTrue(0.0 <= action[2] <= 1.0)
 
 
 if __name__ == "__main__":
