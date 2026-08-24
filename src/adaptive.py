@@ -193,6 +193,12 @@ class AdaptiveResponseTable:
                 f"response table is missing {len(missing)} of {len(self.epsilon_grid) ** 2} cells"
             )
 
+    def statistics_snapshot(
+        self,
+    ) -> dict[tuple[float, float], ResponseStatistics]:
+        """Return an independent statistics mapping suitable for a warm start."""
+        return {key: moments.snapshot() for key, moments in self._moments.items()}
+
 
 @dataclass(frozen=True)
 class AdaptiveDecision:
@@ -217,28 +223,38 @@ class AdaptiveMarketMakerCompetitor:
         market_share_target: float,
         risk_aversion: float,
         probe_interval: int | None = 100,
+        initial_response_statistics: Mapping[
+            tuple[float, float], ResponseStatistics
+        ]
+        | None = None,
     ) -> None:
         if probe_interval is not None and probe_interval <= 0:
             raise ValueError("probe_interval must be positive or None")
         self.market_share_target = float(market_share_target)
         self.risk_aversion = float(risk_aversion)
         self.probe_interval = probe_interval
+        self._initial_response_statistics = dict(initial_response_statistics or {})
+        if self._initial_response_statistics:
+            initial_table = AdaptiveResponseTable(self._initial_response_statistics)
+            initial_table.validate_complete()
         self.reset_adaptive_state()
 
     def reset_adaptive_state(self) -> None:
-        self.response_table = AdaptiveResponseTable()
+        self.response_table = AdaptiveResponseTable(self._initial_response_statistics)
         self.market_maker = AdaptiveMarketMaker(
             self.response_table,
             market_share_target=self.market_share_target,
             risk_aversion=self.risk_aversion,
         )
-        self._cold_start_sequence = cold_start_quotes()
+        self._cold_start_sequence = (
+            () if self._initial_response_statistics else cold_start_quotes()
+        )
         self._cold_start_index = 0
         self._probe_index = 0
         self._adaptive_step = 0
         self.last_base_epsilon = float("nan")
         self.last_action = np.zeros(3, dtype=np.float32)
-        self.last_action_was_cold_start = True
+        self.last_action_was_cold_start = not bool(self._initial_response_statistics)
         self.last_action_was_probe = False
 
     @property

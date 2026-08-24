@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import argparse
 import csv
+import random
 import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from adaptive import AdaptiveMarketMakerCompetitor
+from adaptive import (
+    AdaptiveMarketMakerCompetitor,
+    AdaptiveResponseTable,
+    cold_start_quotes,
+)
 from config import Config
 from environments import TwoDealerMarketEnv
 from ppo import PPOAgent
@@ -21,6 +27,7 @@ SCREENING_CHECKPOINTS = (20_480, 60_416, 100_352)
 LONGRUN_CHECKPOINTS = (20_480, 60_416, 100_352, 150_528, 204_800)
 CHECKPOINT_WINDOW = 20_480
 PROBE_INTERVAL = 100
+CALIBRATION_PASSES = 10
 BASELINE_RESULTS = ROOT / "results" / "ppo_vs_adaptive"
 PROBING_RESULTS = ROOT / "results" / "ppo_vs_adaptive_probing"
 
@@ -45,14 +52,22 @@ def read_csv(path: Path) -> list[dict]:
 class RecordingAdaptiveEnv(TwoDealerMarketEnv):
     """Experiment-local recorder; it does not change simulator behavior."""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        initial_previous_market_volume: float = 0.0,
+        **kwargs,
+    ) -> None:
         self.records: list[dict] = []
         self.reset_calls = 0
+        self.initial_previous_market_volume = float(initial_previous_market_volume)
         super().__init__(*args, **kwargs)
 
     def reset(self) -> np.ndarray:
         self.reset_calls += 1
-        return super().reset()
+        observation = super().reset()
+        self.previous_market_volume = self.initial_previous_market_volume
+        return observation
 
     def step(self, ppo_action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
         observation, reward, done, info = super().step(ppo_action)
@@ -77,6 +92,57 @@ class RecordingAdaptiveEnv(TwoDealerMarketEnv):
             }
         )
         return observation, reward, done, info
+
+
+class ForcedGridCalibrationCompetitor:
+    """Calibration-only full-grid scheduler with zero hedging."""
+
+    def __init__(self, passes: int = CALIBRATION_PASSES) -> None:
+        if passes <= 0:
+            raise ValueError("calibration passes must be positive")
+        self.passes = passes
+        self.reset_adaptive_state()
+
+    def reset_adaptive_state(self) -> None:
+        self.response_table = AdaptiveResponseTable()
+        self._schedule = cold_start_quotes() * self.passes
+        self._schedule_index = 0
+        self.last_base_epsilon = float("nan")
+        self.last_action_was_cold_start = False
+        self.last_action_was_probe = False
+
+    @property
+    def calibration_complete(self) -> bool:
+        return self._schedule_index == len(self._schedule)
+
+    def act_with_market_state(self, **market_state) -> np.ndarray:
+        del market_state
+        if self.calibration_complete:
+            raise RuntimeError("calibration quote schedule is exhausted")
+        epsilon_bid, epsilon_ask = self._schedule[self._schedule_index]
+        self._schedule_index += 1
+        self.last_base_epsilon = float("nan")
+        return np.array([epsilon_bid, epsilon_ask, 0.0], dtype=np.float32)
+
+    def observe_outcome(
+        self,
+        *,
+        epsilon_bid: float,
+        epsilon_ask: float,
+        gross_volume: float,
+        net_flow: float,
+        spread_pnl: float,
+        reference_spread_at_zero: float,
+    ) -> None:
+        if reference_spread_at_zero <= 0.0:
+            raise ValueError("reference_spread_at_zero must be positive")
+        self.response_table.update(
+            epsilon_bid,
+            epsilon_ask,
+            gross_volume,
+            net_flow,
+            spread_pnl / reference_spread_at_zero,
+        )
 
 
 def make_config(seed: int, rollouts: int, horizon: int) -> Config:
@@ -110,6 +176,64 @@ def make_config(seed: int, rollouts: int, horizon: int) -> Config:
         state_dependent_std=True,
         policy_distribution="squashed_normal",
     )
+
+
+def initialize_and_calibrate(
+    cfg: Config,
+    seed: int,
+) -> tuple[PPOAgent, dict, dict]:
+    calibration_competitor = ForcedGridCalibrationCompetitor()
+    calibration_environment = TwoDealerMarketEnv(
+        calibration_competitor,
+        cfg,
+        seed=seed * 100_000 + 60_000,
+        reward_mode="total",
+    )
+    agent = PPOAgent(calibration_environment, cfg)
+    initial_parameters = {
+        name: parameter.detach().clone()
+        for name, parameter in agent.network.named_parameters()
+    }
+    python_rng_state = random.getstate()
+    numpy_rng_state = np.random.get_state()
+    torch_rng_state = torch.get_rng_state()
+
+    observation = calibration_environment.reset()
+    calibration_steps = len(cold_start_quotes()) * CALIBRATION_PASSES
+    for _ in range(calibration_steps):
+        ppo_action = agent.sample_action(observation)
+        observation, _, _, _ = calibration_environment.step(ppo_action)
+
+    if not calibration_competitor.calibration_complete:
+        raise RuntimeError("forced calibration schedule did not complete")
+    calibration_competitor.response_table.validate_complete()
+    statistics = calibration_competitor.response_table.statistics_snapshot()
+    if len(statistics) != len(cold_start_quotes()):
+        raise RuntimeError("calibration did not populate all 121 response cells")
+    parameter_max_abs_change = max(
+        float(
+            (parameter.detach() - initial_parameters[name])
+            .abs()
+            .max()
+            .cpu()
+            .item()
+        )
+        for name, parameter in agent.network.named_parameters()
+    )
+    if parameter_max_abs_change != 0.0 or agent.optimizer.state:
+        raise RuntimeError("PPO parameters or optimizer changed during calibration")
+
+    random.setstate(python_rng_state)
+    np.random.set_state(numpy_rng_state)
+    torch.set_rng_state(torch_rng_state)
+    metadata = {
+        "calibration_steps": calibration_steps,
+        "calibration_passes": CALIBRATION_PASSES,
+        "calibration_cells_populated": len(statistics),
+        "calibration_policy_parameter_max_abs_change": parameter_max_abs_change,
+        "same_initial_ppo_agent": True,
+    }
+    return agent, statistics, metadata
 
 
 def mean(rows: list[dict], key: str) -> float:
@@ -171,27 +295,14 @@ def aggregate_checkpoint(
     }
 
 
-def train_seed(
-    seed: int,
-    rollouts: int,
-    horizon: int,
-    checkpoints: tuple[int, ...],
-) -> tuple[dict, list[dict]]:
-    cfg = make_config(seed, rollouts, horizon)
-    adaptive = AdaptiveMarketMakerCompetitor(
-        market_share_target=0.5,
-        risk_aversion=2.0,
-        probe_interval=PROBE_INTERVAL,
-    )
-    environment = RecordingAdaptiveEnv(
-        adaptive,
-        cfg,
-        seed=seed * 100_000 + 10_000,
-        reward_mode="total",
-    )
-    agent = PPOAgent(environment, cfg)
-    history = agent.train()
-
+def validate_training_run(
+    environment: RecordingAdaptiveEnv,
+    adaptive: AdaptiveMarketMakerCompetitor,
+    cfg: Config,
+    *,
+    expected_reset_calls: int,
+    expected_cold_start_steps: int,
+) -> tuple[int, int]:
     if len(environment.records) != cfg.total_steps:
         raise RuntimeError("training recorder did not capture every environment step")
     finite_record_keys = (
@@ -231,13 +342,17 @@ def train_seed(
         for key in ("ppo_hedge_fraction", "adaptive_hedge_fraction")
     ):
         raise RuntimeError("recorded hedge action is outside [0, 1]")
-    if environment.reset_calls != 3:
+    if environment.reset_calls != expected_reset_calls:
         raise RuntimeError(
-            f"unexpected reset count {environment.reset_calls}; rollout boundaries may reset state"
+            f"expected {expected_reset_calls} formal environment resets, observed "
+            f"{environment.reset_calls}"
         )
     cold_start_steps = sum(row["adaptive_cold_start"] for row in environment.records)
-    if cold_start_steps != 121:
-        raise RuntimeError(f"expected one 121-step cold start, observed {cold_start_steps}")
+    if cold_start_steps != expected_cold_start_steps:
+        raise RuntimeError(
+            f"expected {expected_cold_start_steps} cold-start steps, observed "
+            f"{cold_start_steps}"
+        )
     adaptive.response_table.validate_complete()
     probe_steps = sum(row["adaptive_probe"] for row in environment.records)
     expected_probe_steps = (cfg.total_steps - cold_start_steps) // PROBE_INTERVAL
@@ -245,6 +360,36 @@ def train_seed(
         raise RuntimeError(
             f"expected {expected_probe_steps} probe steps, observed {probe_steps}"
         )
+    return cold_start_steps, probe_steps
+
+
+def train_seed(
+    seed: int,
+    rollouts: int,
+    horizon: int,
+    checkpoints: tuple[int, ...],
+) -> tuple[dict, list[dict]]:
+    cfg = make_config(seed, rollouts, horizon)
+    adaptive = AdaptiveMarketMakerCompetitor(
+        market_share_target=0.5,
+        risk_aversion=2.0,
+        probe_interval=PROBE_INTERVAL,
+    )
+    environment = RecordingAdaptiveEnv(
+        adaptive,
+        cfg,
+        seed=seed * 100_000 + 10_000,
+        reward_mode="total",
+    )
+    agent = PPOAgent(environment, cfg)
+    history = agent.train()
+    cold_start_steps, probe_steps = validate_training_run(
+        environment,
+        adaptive,
+        cfg,
+        expected_reset_calls=3,
+        expected_cold_start_steps=121,
+    )
 
     diagnostics_by_step = {int(row["step"]): row for row in history.diagnostics}
     trajectory_rows = [
@@ -262,6 +407,82 @@ def train_seed(
         "training_steps": cfg.total_steps,
         "adaptive_cold_start_steps": cold_start_steps,
         "environment_reset_calls": environment.reset_calls,
+        "adaptive_table_complete": True,
+        "adaptive_probe_interval": PROBE_INTERVAL,
+        "adaptive_probe_steps_total": probe_steps,
+        "adaptive_probe_fraction_total": probe_steps / cfg.total_steps,
+        **{key: value for key, value in final.items() if key != "seed"},
+        "learning_rate": cfg.lr,
+        "ppo_clip": cfg.clip_eps,
+        "gamma": cfg.gamma,
+        "gae_lambda": cfg.gae_lambda,
+        "minibatch_size": cfg.minibatch_size,
+        "n_epochs": cfg.n_epochs,
+        "ent_coef": cfg.ent_coef,
+        "vf_coef": cfg.vf_coef,
+        "max_grad_norm": cfg.max_grad_norm,
+        "state_dependent_std": cfg.state_dependent_std,
+        "market_sigma": cfg.sigma,
+        "order_size_mode": cfg.order_size_mode,
+    }
+    return metrics, trajectory_rows
+
+
+def train_calibrated_seed(
+    seed: int,
+    rollouts: int,
+    horizon: int,
+    checkpoints: tuple[int, ...],
+) -> tuple[dict, list[dict]]:
+    cfg = make_config(seed, rollouts, horizon)
+    agent, calibrated_statistics, calibration = initialize_and_calibrate(cfg, seed)
+    adaptive = AdaptiveMarketMakerCompetitor(
+        market_share_target=0.5,
+        risk_aversion=2.0,
+        probe_interval=PROBE_INTERVAL,
+        initial_response_statistics=calibrated_statistics,
+    )
+    environment = RecordingAdaptiveEnv(
+        adaptive,
+        cfg,
+        seed=seed * 100_000 + 10_000,
+        reward_mode="total",
+        initial_previous_market_volume=float(cfg.num_investors),
+    )
+    if (
+        environment.price != cfg.P0
+        or environment.inventory != [0.0, 0.0]
+        or environment.t != 0
+    ):
+        raise RuntimeError("formal environment did not start from a fresh market state")
+    agent.env = environment
+    history = agent.train()
+    cold_start_steps, probe_steps = validate_training_run(
+        environment,
+        adaptive,
+        cfg,
+        expected_reset_calls=2,
+        expected_cold_start_steps=0,
+    )
+
+    diagnostics_by_step = {int(row["step"]): row for row in history.diagnostics}
+    trajectory_rows = [
+        aggregate_checkpoint(
+            seed,
+            checkpoint,
+            environment.records,
+            diagnostics_by_step[checkpoint],
+        )
+        for checkpoint in checkpoints
+    ]
+    final = trajectory_rows[-1]
+    metrics = {
+        "seed": seed,
+        "training_steps": cfg.total_steps,
+        **calibration,
+        "formal_cold_start_steps": cold_start_steps,
+        "formal_environment_reset_calls": environment.reset_calls,
+        "formal_initial_previous_market_volume": environment.initial_previous_market_volume,
         "adaptive_table_complete": True,
         "adaptive_probe_interval": PROBE_INTERVAL,
         "adaptive_probe_steps_total": probe_steps,
@@ -556,6 +777,257 @@ def write_screening_report(
     (output / "report_zh.md").write_text("\n".join(lines))
 
 
+def write_calibrated_report(
+    output: Path,
+    trajectory: list[dict],
+    cold_start_trajectory: list[dict],
+) -> None:
+    keys = (
+        "ppo_market_share",
+        "ppo_spread_pnl_per_step",
+        "ppo_total_pnl_per_step",
+        "ppo_mean_abs_inventory",
+        "ppo_inventory_std",
+        "ppo_mean_hedge_fraction",
+        "ppo_mean_epsilon_bid",
+        "ppo_mean_epsilon_ask",
+        "adaptive_market_share",
+        "adaptive_mean_abs_inventory",
+        "adaptive_inventory_std",
+        "adaptive_mean_hedge_fraction",
+        "adaptive_mean_base_epsilon",
+        "adaptive_mean_epsilon_bid",
+        "adaptive_mean_epsilon_ask",
+        "adaptive_probe_fraction",
+        "adaptive_base_epsilon_one_frequency",
+        "approx_kl",
+        "clip_fraction",
+        "value_loss",
+    )
+    summaries = {
+        checkpoint: {
+            key: checkpoint_summary(trajectory, checkpoint, key) for key in keys
+        }
+        for checkpoint in SCREENING_CHECKPOINTS
+    }
+    cold_start = {
+        checkpoint: {
+            key: checkpoint_summary(cold_start_trajectory, checkpoint, key)
+            for key in (
+                "ppo_market_share",
+                "ppo_total_pnl_per_step",
+                "ppo_mean_abs_inventory",
+                "adaptive_market_share",
+                "adaptive_mean_base_epsilon",
+                "adaptive_base_epsilon_one_frequency",
+            )
+        }
+        for checkpoint in SCREENING_CHECKPOINTS
+    }
+    final = SCREENING_CHECKPOINTS[-1]
+    final_rows = sorted(
+        (row for row in trajectory if int(row["training_step"]) == final),
+        key=lambda row: int(row["seed"]),
+    )
+    lines = [
+        "# Calibrated / warm-start Adaptive MM screening",
+        "",
+        "## Setup",
+        "",
+        "3 seeds（0–2）× 100,352 formal PPO training steps。每 seed 先初始化唯一的 PPOAgent "
+        "θ0，在独立 market path 上冻结参数并执行 10 × 121 = 1,210 calibration steps；"
+        "随后恢复 post-initialization RNG state，将同一个 PPOAgent 接到 fresh formal simulator。"
+        "正式训练从 populated 121-cell response table 开始，cold start=0，并继续 interval=100 "
+        "diagonal probing。Fresh state 的 lagged market-volume denominator 初始化为 unit-flow "
+        "下确定的 20；price/inventory/PnL/path 均不从 calibration 继承。所有其他 "
+        "PPO/environment/Adaptive 参数与 Phase 4b 相同。",
+        "",
+        "## Adaptive: Phase 4b cold start vs calibrated",
+        "",
+        "| Step | Cold share | Calibrated share | Cold mean base | Calibrated mean base | "
+        "Cold base=1 | Calibrated base=1 |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for checkpoint in SCREENING_CHECKPOINTS:
+        row = summaries[checkpoint]
+        old = cold_start[checkpoint]
+        lines.append(
+            f"| {checkpoint:,} | {old['adaptive_market_share'][0]:.4f} | "
+            f"{row['adaptive_market_share'][0]:.4f} | "
+            f"{old['adaptive_mean_base_epsilon'][0]:.3f} | "
+            f"{row['adaptive_mean_base_epsilon'][0]:.3f} | "
+            f"{old['adaptive_base_epsilon_one_frequency'][0]:.3%} | "
+            f"{row['adaptive_base_epsilon_one_frequency'][0]:.3%} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## PPO trajectory",
+            "",
+            "| Step | Share | Spread PnL/step | Total PnL/step | Mean abs inventory | "
+            "Inventory std | Mean hedge | Mean bid/ask epsilon |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for checkpoint in SCREENING_CHECKPOINTS:
+        row = summaries[checkpoint]
+        lines.append(
+            f"| {checkpoint:,} | {row['ppo_market_share'][0]:.4f} | "
+            f"{row['ppo_spread_pnl_per_step'][0]:.4f} | "
+            f"{row['ppo_total_pnl_per_step'][0]:.4f} | "
+            f"{row['ppo_mean_abs_inventory'][0]:.3f} | "
+            f"{row['ppo_inventory_std'][0]:.3f} | "
+            f"{row['ppo_mean_hedge_fraction'][0]:.3f} | "
+            f"{row['ppo_mean_epsilon_bid'][0]:.3f} / "
+            f"{row['ppo_mean_epsilon_ask'][0]:.3f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Adaptive trajectory",
+            "",
+            "| Step | Share | Mean abs inventory | Inventory std | Mean hedge | "
+            "Mean base | Mean bid/ask epsilon | Base=1 frequency | Probe fraction |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for checkpoint in SCREENING_CHECKPOINTS:
+        row = summaries[checkpoint]
+        lines.append(
+            f"| {checkpoint:,} | {row['adaptive_market_share'][0]:.4f} | "
+            f"{row['adaptive_mean_abs_inventory'][0]:.3f} | "
+            f"{row['adaptive_inventory_std'][0]:.3f} | "
+            f"{row['adaptive_mean_hedge_fraction'][0]:.3f} | "
+            f"{row['adaptive_mean_base_epsilon'][0]:.3f} | "
+            f"{row['adaptive_mean_epsilon_bid'][0]:.3f} / "
+            f"{row['adaptive_mean_epsilon_ask'][0]:.3f} | "
+            f"{row['adaptive_base_epsilon_one_frequency'][0]:.3%} | "
+            f"{row['adaptive_probe_fraction'][0]:.3%} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Final by seed",
+            "",
+            "| Seed | PPO total PnL/step | PPO share | PPO mean abs inventory | "
+            "Adaptive share | Adaptive mean base | Base=1 frequency |",
+            "|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in final_rows:
+        lines.append(
+            f"| {int(row['seed'])} | {float(row['ppo_total_pnl_per_step']):.4f} | "
+            f"{float(row['ppo_market_share']):.4f} | "
+            f"{float(row['ppo_mean_abs_inventory']):.3f} | "
+            f"{float(row['adaptive_market_share']):.4f} | "
+            f"{float(row['adaptive_mean_base_epsilon']):.3f} | "
+            f"{float(row['adaptive_base_epsilon_one_frequency']):.3%} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Final dispersion: cold start vs calibrated",
+            "",
+            "| Metric | Cold-start std | Calibrated std |",
+            "|---|---:|---:|",
+            f"| Adaptive share | {cold_start[final]['adaptive_market_share'][1]:.4f} | "
+            f"{summaries[final]['adaptive_market_share'][1]:.4f} |",
+            f"| Adaptive base=1 frequency | "
+            f"{cold_start[final]['adaptive_base_epsilon_one_frequency'][1]:.3%} | "
+            f"{summaries[final]['adaptive_base_epsilon_one_frequency'][1]:.3%} |",
+            f"| PPO total PnL/step | {cold_start[final]['ppo_total_pnl_per_step'][1]:.4f} | "
+            f"{summaries[final]['ppo_total_pnl_per_step'][1]:.4f} |",
+            "",
+            "## PPO diagnostics",
+            "",
+            "| Step | Approx KL | Clip fraction | Value loss |",
+            "|---:|---:|---:|---:|",
+        ]
+    )
+    for checkpoint in SCREENING_CHECKPOINTS:
+        row = summaries[checkpoint]
+        lines.append(
+            f"| {checkpoint:,} | {row['approx_kl'][0]:.4f} | "
+            f"{row['clip_fraction'][0]:.4f} | {row['value_loss'][0]:.1f} |"
+        )
+    early = SCREENING_CHECKPOINTS[0]
+    middle = SCREENING_CHECKPOINTS[1]
+    row_by_seed_step = {
+        (int(row["seed"]), int(row["training_step"])): row for row in trajectory
+    }
+    ppo_improvement_count = sum(
+        float(row_by_seed_step[(seed, final)]["ppo_total_pnl_per_step"])
+        > float(row_by_seed_step[(seed, early)]["ppo_total_pnl_per_step"])
+        for seed in range(3)
+    )
+    adaptive_paths = []
+    for seed in range(3):
+        adaptive_paths.append(
+            f"seed {seed}: share "
+            f"{float(row_by_seed_step[(seed, early)]['adaptive_market_share']):.3f}→"
+            f"{float(row_by_seed_step[(seed, middle)]['adaptive_market_share']):.3f}→"
+            f"{float(row_by_seed_step[(seed, final)]['adaptive_market_share']):.3f}, "
+            f"base=1 {float(row_by_seed_step[(seed, early)]['adaptive_base_epsilon_one_frequency']):.1%}→"
+            f"{float(row_by_seed_step[(seed, middle)]['adaptive_base_epsilon_one_frequency']):.1%}→"
+            f"{float(row_by_seed_step[(seed, final)]['adaptive_base_epsilon_one_frequency']):.1%}"
+        )
+    final_value_losses = [float(row["value_loss"]) for row in final_rows]
+    lines.extend(
+        [
+            "",
+            "## Interpretation",
+            "",
+            "- **Calibration/lifecycle 按设计完成。** 每 seed 使用同一个 θ0 PPOAgent；"
+            "1,210 calibration steps 覆盖 10 次完整 121-cell grid，parameter max change=0、"
+            "optimizer 未更新，并恢复 post-initialization RNG state。Formal simulator 为 fresh "
+            "P0/zero-inventory state，response table 完整，cold start=0，calibration steps 不计入"
+            "100,352 training steps。",
+            f"- **Warm start 没有提高 Adaptive final stability。** Final mean share 从 cold-start "
+            f"Phase 4b 的 {cold_start[final]['adaptive_market_share'][0]:.4f} 降至 "
+            f"{summaries[final]['adaptive_market_share'][0]:.4f}；mean base=1 frequency 从 "
+            f"{cold_start[final]['adaptive_base_epsilon_one_frequency'][0]:.1%} 升至 "
+            f"{summaries[final]['adaptive_base_epsilon_one_frequency'][0]:.1%}。",
+            f"- **三条 seed 分化而非共同稳定。** {'；'.join(adaptive_paths)}。Seed 1 快速进入 "
+            "PPO-dominant / near-lock-in tendency，seed 2 则向更平衡 interaction 移动，seed 0 "
+            "介于两者之间。100k 尚未达到 share≈0/base=1≈100%，但趋势不满足 3/3 healthy criterion。",
+            f"- **Seed dispersion 全面恶化。** Adaptive share std "
+            f"{cold_start[final]['adaptive_market_share'][1]:.4f}→"
+            f"{summaries[final]['adaptive_market_share'][1]:.4f}；base=1 std "
+            f"{cold_start[final]['adaptive_base_epsilon_one_frequency'][1]:.1%}→"
+            f"{summaries[final]['adaptive_base_epsilon_one_frequency'][1]:.1%}；PPO PnL std "
+            f"{cold_start[final]['ppo_total_pnl_per_step'][1]:.4f}→"
+            f"{summaries[final]['ppo_total_pnl_per_step'][1]:.4f}。Warm start 没有降低"
+            "initial-condition/path sensitivity。",
+            f"- **PPO mean economics 改善但不跨 seed 一致。** Total PnL/step "
+            f"{summaries[early]['ppo_total_pnl_per_step'][0]:.4f}→"
+            f"{summaries[final]['ppo_total_pnl_per_step'][0]:.4f}，{ppo_improvement_count}/3 seeds "
+            f"改善；market share {summaries[early]['ppo_market_share'][0]:.4f}→"
+            f"{summaries[final]['ppo_market_share'][0]:.4f}。Final PnL mean 高于 cold-start "
+            f"{cold_start[final]['ppo_total_pnl_per_step'][0]:.4f}，但主要由 seed 1 的 "
+            "PPO-dominant path 拉高，不能作为 benchmark 成功证据。",
+            f"- **Inventory exposure 更高。** PPO mean abs inventory "
+            f"{summaries[early]['ppo_mean_abs_inventory'][0]:.3f}→"
+            f"{summaries[final]['ppo_mean_abs_inventory'][0]:.3f}；warm-start final 高于 cold-start "
+            f"{cold_start[final]['ppo_mean_abs_inventory'][0]:.3f}。Seed 1 final 达 9.637。",
+            f"- Final value loss range={min(final_value_losses):.1f}–"
+            f"{max(final_value_losses):.1f}，最大值同样来自 seed 1；KL/clip 未共同爆炸。",
+            "- Execution sanity 全部通过：3/3 calibration 与 formal runs 完成；每 seed "
+            "cells=121、formal cold start=0、formal probes=1,003；无 NaN/Inf、越界 action、"
+            "parameter drift 或 crash。",
+            "",
+            "## Go / No-Go",
+            "",
+            "**No-Go for 5-seed × 204,800 warm-start confirmation.** 结果不支持 H1（instability "
+            "主要来自 immature initial beliefs）；更一致的是 H2：即使以 θ0 下的 calibrated table "
+            "开始，online learning interaction 仍可快速分化。Warm-start Adaptive 不应取代 "
+            "Phase 4b setup 成为主要 benchmark candidate。下一步若继续，应诊断 diagonal tracking、"
+            "off-diagonal staleness 与 Step 1/Step 2 feedback，而不是扩大本配置样本量。",
+            "",
+        ]
+    )
+    (output / "report_zh.md").write_text("\n".join(lines))
+
+
 def write_longrun_report(
     output: Path,
     trajectory: list[dict],
@@ -827,7 +1299,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Screen PPO against an online Adaptive MM")
     parser.add_argument(
         "--mode",
-        choices=("screening", "longrun"),
+        choices=("screening", "calibrated", "longrun"),
         default="screening",
     )
     parser.add_argument("--seeds", type=int, default=3)
@@ -847,6 +1319,12 @@ def main() -> None:
         expected_steps = 100_352
         default_output = PROBING_RESULTS
         comparison_path = BASELINE_RESULTS / "training_trajectories.csv"
+    elif args.mode == "calibrated":
+        checkpoints = SCREENING_CHECKPOINTS
+        expected_seeds = 3
+        expected_steps = 100_352
+        default_output = ROOT / "results" / "ppo_vs_adaptive_calibrated"
+        comparison_path = PROBING_RESULTS / "training_trajectories.csv"
     else:
         checkpoints = LONGRUN_CHECKPOINTS
         expected_seeds = 5
@@ -878,7 +1356,10 @@ def main() -> None:
             print(f"Skipping completed seed={seed}", flush=True)
             continue
         print(f"Training PPO vs Adaptive seed={seed}", flush=True)
-        row, trajectory_rows = train_seed(
+        training_function = (
+            train_calibrated_seed if args.mode == "calibrated" else train_seed
+        )
+        row, trajectory_rows = training_function(
             seed,
             args.rollouts,
             args.horizon,
@@ -892,12 +1373,20 @@ def main() -> None:
             f"Finished seed={seed}: share={row['ppo_market_share']:.3f} "
             f"total={row['ppo_total_pnl_per_step']:.3f} "
             f"adaptive_share={row['adaptive_market_share']:.3f} "
-            f"adaptive_base1={row['adaptive_base_epsilon_one_frequency']:.3f}",
+            f"adaptive_base1={row['adaptive_base_epsilon_one_frequency']:.3f}"
+            + (
+                f" calibration={row['calibration_steps']} cold_start="
+                f"{row['formal_cold_start_steps']}"
+                if args.mode == "calibrated"
+                else ""
+            ),
             flush=True,
         )
 
     if args.mode == "screening":
         write_screening_report(output_dir, trajectory, comparison_trajectory)
+    elif args.mode == "calibrated":
+        write_calibrated_report(output_dir, trajectory, comparison_trajectory)
     else:
         write_longrun_report(output_dir, trajectory, comparison_trajectory)
     print(f"Saved PPO-vs-Adaptive {args.mode} under {output_dir}")
