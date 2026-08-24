@@ -1,9 +1,9 @@
-# Adaptive Market Maker: Phase 1 Decision Logic
+# Adaptive Market Maker: Decision Logic and Online Response Table
 
 This module is a paper-faithful but documented interpretation of Ganesh et al.
-(NeurIPS 2019). Phase 1 implements only deterministic decisions over an already
-populated response table. It is not connected to either simulator, and it does
-not define cold-start or online-learning behavior.
+(NeurIPS 2019). It implements deterministic decisions, online response updates,
+and a deterministic cold-start quote sequence. It is not connected to either
+simulator.
 
 ## Response table
 
@@ -26,8 +26,43 @@ Normalized spread PnL is defined for future table updates as total timestep
 spread PnL divided by the same timestep's `S_ref,t(0)`. It is not normalized by
 volume or fill count.
 
-An unpopulated cell raises `MissingResponseStatistics`. Phase 1 intentionally
-has no default values, warm-up policy, or unseen-cell fallback.
+An unpopulated cell raises `MissingResponseStatistics`. There are no default
+values, priors, interpolation, or unseen-cell fallbacks.
+
+## Online updates
+
+The paper's `beta = 0.35` is interpreted as old-estimate retention. The first
+observation at a cell initializes its mean and second moment directly:
+
+```text
+m = y
+m2 = y**2
+```
+
+Later observations update both moments with the same EMA:
+
+```text
+m_new = 0.35 * m_old + 0.65 * y
+m2_new = 0.35 * m2_old + 0.65 * y**2
+```
+
+Variance is recovered without bias correction as `max(m2 - m**2, 0)`. Only the
+joint quote cell that was actually executed is updated; all other cells remain
+unchanged.
+
+These rules are implementation choices because the paper specifies only an
+exponential forgetting factor, not the recursion, initialization, or variance
+estimator.
+
+## Cold start
+
+`cold_start_quotes()` returns one deterministic full-grid pass of 121 unique
+quotes. The first 11 quotes traverse the diagonal in ascending epsilon order.
+The remaining off-diagonal cells use bid-major, then ask-major grid order.
+
+This deterministic pass is an implementation choice: the paper does not define
+a cold-start or exploration policy. The function only returns quotes; it is not
+a scheduler, state machine, or adaptive exploration mechanism.
 
 ## Decisions
 
@@ -43,15 +78,3 @@ largest epsilon, avoiding unnecessary quote aggression.
 Hedging enumerates 101 fractions on `[0, 1]`. It uses the net-flow mean and
 variance associated with the final post-skew quote. Equal objective values
 select the smallest hedge fraction.
-
-## Deferred online update choice
-
-Online population is deliberately deferred. When implemented, the documented
-choice is to interpret the paper's `beta = 0.35` as old-estimate retention:
-
-```text
-m_t = 0.35 * m_(t-1) + 0.65 * y_t
-```
-
-The mean and second moment will use the same EMA, with variance recovered as
-`max(m2 - m1**2, 0)`. This rule is documented here but is not active in Phase 1.

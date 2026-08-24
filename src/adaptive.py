@@ -9,6 +9,7 @@ import numpy as np
 
 DEFAULT_EPSILON_GRID = tuple(round(float(value), 1) for value in np.linspace(-1.0, 1.0, 11))
 DEFAULT_HEDGE_GRID = tuple(round(float(value), 2) for value in np.linspace(0.0, 1.0, 101))
+OLD_ESTIMATE_RETENTION = 0.35
 
 
 @dataclass(frozen=True)
@@ -32,16 +33,73 @@ class MissingResponseStatistics(ValueError):
     """Raised when decision logic encounters an unpopulated response-table cell."""
 
 
-class AdaptiveResponseTable:
-    """Read-only decision-time view of a populated joint response table.
+@dataclass
+class _ResponseMoments:
+    mean_gross_volume: float
+    mean_net_flow: float
+    second_moment_net_flow: float
+    mean_normalized_spread_pnl: float
+    second_moment_normalized_spread_pnl: float
 
-    Phase 1 intentionally provides no cold-start, interpolation, or online-update
-    behavior. Decisions fail explicitly if any required grid cell is absent.
+    @classmethod
+    def from_statistics(cls, statistics: ResponseStatistics) -> "_ResponseMoments":
+        return cls(
+            mean_gross_volume=statistics.mean_gross_volume,
+            mean_net_flow=statistics.mean_net_flow,
+            second_moment_net_flow=(
+                statistics.variance_net_flow + statistics.mean_net_flow**2
+            ),
+            mean_normalized_spread_pnl=statistics.mean_normalized_spread_pnl,
+            second_moment_normalized_spread_pnl=(
+                statistics.variance_normalized_spread_pnl
+                + statistics.mean_normalized_spread_pnl**2
+            ),
+        )
+
+    def snapshot(self) -> ResponseStatistics:
+        return ResponseStatistics(
+            mean_gross_volume=self.mean_gross_volume,
+            mean_net_flow=self.mean_net_flow,
+            variance_net_flow=max(
+                self.second_moment_net_flow - self.mean_net_flow**2,
+                0.0,
+            ),
+            mean_normalized_spread_pnl=self.mean_normalized_spread_pnl,
+            variance_normalized_spread_pnl=max(
+                self.second_moment_normalized_spread_pnl
+                - self.mean_normalized_spread_pnl**2,
+                0.0,
+            ),
+        )
+
+
+def cold_start_quotes(
+    epsilon_grid: Sequence[float] = DEFAULT_EPSILON_GRID,
+) -> tuple[tuple[float, float], ...]:
+    """Return a deterministic full-grid pass, diagonal quotes first."""
+    grid = tuple(float(value) for value in epsilon_grid)
+    if not grid or len(set(grid)) != len(grid):
+        raise ValueError("epsilon_grid must be nonempty and contain unique values")
+    diagonal = tuple((epsilon, epsilon) for epsilon in grid)
+    off_diagonal = tuple(
+        (epsilon_bid, epsilon_ask)
+        for epsilon_bid in grid
+        for epsilon_ask in grid
+        if epsilon_bid != epsilon_ask
+    )
+    return diagonal + off_diagonal
+
+
+class AdaptiveResponseTable:
+    """Online empirical moments for joint quote responses.
+
+    Only an explicitly updated cell changes. Unvisited cells have no prior and
+    fail fast at lookup time.
     """
 
     def __init__(
         self,
-        statistics: Mapping[tuple[float, float], ResponseStatistics],
+        statistics: Mapping[tuple[float, float], ResponseStatistics] | None = None,
         epsilon_grid: Sequence[float] = DEFAULT_EPSILON_GRID,
     ) -> None:
         grid = tuple(float(value) for value in epsilon_grid)
@@ -51,9 +109,11 @@ class AdaptiveResponseTable:
             raise ValueError("epsilon_grid must lie within [-1, 1]")
 
         self.epsilon_grid = grid
-        self._statistics = {
-            (self._canonical_epsilon(bid), self._canonical_epsilon(ask)): value
-            for (bid, ask), value in statistics.items()
+        self._moments = {
+            (self._canonical_epsilon(bid), self._canonical_epsilon(ask)): (
+                _ResponseMoments.from_statistics(value)
+            )
+            for (bid, ask), value in (statistics or {}).items()
         }
 
     def _canonical_epsilon(self, epsilon: float) -> float:
@@ -65,18 +125,64 @@ class AdaptiveResponseTable:
     def lookup(self, epsilon_bid: float, epsilon_ask: float) -> ResponseStatistics:
         key = (self._canonical_epsilon(epsilon_bid), self._canonical_epsilon(epsilon_ask))
         try:
-            return self._statistics[key]
+            return self._moments[key].snapshot()
         except KeyError as error:
             raise MissingResponseStatistics(
                 f"response-table cell {key} is unpopulated; cold-start behavior is intentionally undefined"
             ) from error
+
+    def update(
+        self,
+        epsilon_bid: float,
+        epsilon_ask: float,
+        gross_volume: float,
+        net_flow: float,
+        normalized_spread_pnl: float,
+    ) -> None:
+        """Update the executed quote cell using beta=0.35 old-estimate retention."""
+        key = (self._canonical_epsilon(epsilon_bid), self._canonical_epsilon(epsilon_ask))
+        gross_volume = float(gross_volume)
+        net_flow = float(net_flow)
+        normalized_spread_pnl = float(normalized_spread_pnl)
+
+        if key not in self._moments:
+            self._moments[key] = _ResponseMoments(
+                mean_gross_volume=gross_volume,
+                mean_net_flow=net_flow,
+                second_moment_net_flow=net_flow**2,
+                mean_normalized_spread_pnl=normalized_spread_pnl,
+                second_moment_normalized_spread_pnl=normalized_spread_pnl**2,
+            )
+            return
+
+        moments = self._moments[key]
+        new_weight = 1.0 - OLD_ESTIMATE_RETENTION
+        moments.mean_gross_volume = (
+            OLD_ESTIMATE_RETENTION * moments.mean_gross_volume
+            + new_weight * gross_volume
+        )
+        moments.mean_net_flow = (
+            OLD_ESTIMATE_RETENTION * moments.mean_net_flow + new_weight * net_flow
+        )
+        moments.second_moment_net_flow = (
+            OLD_ESTIMATE_RETENTION * moments.second_moment_net_flow
+            + new_weight * net_flow**2
+        )
+        moments.mean_normalized_spread_pnl = (
+            OLD_ESTIMATE_RETENTION * moments.mean_normalized_spread_pnl
+            + new_weight * normalized_spread_pnl
+        )
+        moments.second_moment_normalized_spread_pnl = (
+            OLD_ESTIMATE_RETENTION * moments.second_moment_normalized_spread_pnl
+            + new_weight * normalized_spread_pnl**2
+        )
 
     def validate_complete(self) -> None:
         missing = [
             (bid, ask)
             for bid in self.epsilon_grid
             for ask in self.epsilon_grid
-            if (bid, ask) not in self._statistics
+            if (bid, ask) not in self._moments
         ]
         if missing:
             raise MissingResponseStatistics(

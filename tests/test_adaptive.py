@@ -14,6 +14,7 @@ from adaptive import (
     AdaptiveResponseTable,
     MissingResponseStatistics,
     ResponseStatistics,
+    cold_start_quotes,
 )
 
 
@@ -141,6 +142,71 @@ class AdaptiveMarketMakerTests(unittest.TestCase):
         table = AdaptiveResponseTable({(0.0, 0.0): response()})
         with self.assertRaisesRegex(MissingResponseStatistics, "cold-start behavior"):
             table.lookup(-0.2, 0.0)
+
+
+class AdaptiveResponseTableUpdateTests(unittest.TestCase):
+    def test_first_update_initializes_cell_directly(self) -> None:
+        table = AdaptiveResponseTable()
+
+        table.update(0.2, -0.4, 3.0, -2.0, 5.0)
+
+        statistics = table.lookup(0.2, -0.4)
+        self.assertEqual(statistics.mean_gross_volume, 3.0)
+        self.assertEqual(statistics.mean_net_flow, -2.0)
+        self.assertEqual(statistics.variance_net_flow, 0.0)
+        self.assertEqual(statistics.mean_normalized_spread_pnl, 5.0)
+        self.assertEqual(statistics.variance_normalized_spread_pnl, 0.0)
+
+    def test_second_update_uses_ema_means_and_second_moments(self) -> None:
+        table = AdaptiveResponseTable()
+        table.update(0.2, -0.4, 10.0, 2.0, 4.0)
+
+        table.update(0.2, -0.4, 4.0, -2.0, 2.0)
+
+        statistics = table.lookup(0.2, -0.4)
+        self.assertAlmostEqual(statistics.mean_gross_volume, 6.1)
+        self.assertAlmostEqual(statistics.mean_net_flow, -0.6)
+        self.assertAlmostEqual(statistics.variance_net_flow, 3.64)
+        self.assertAlmostEqual(statistics.mean_normalized_spread_pnl, 2.7)
+        self.assertAlmostEqual(statistics.variance_normalized_spread_pnl, 0.91)
+
+    def test_update_changes_only_executed_cell(self) -> None:
+        table = AdaptiveResponseTable()
+        table.update(0.0, 0.0, 1.0, 2.0, 3.0)
+        table.update(0.2, 0.0, 4.0, 5.0, 6.0)
+        untouched_before = table.lookup(0.2, 0.0)
+
+        table.update(0.0, 0.0, 7.0, 8.0, 9.0)
+
+        self.assertEqual(table.lookup(0.2, 0.0), untouched_before)
+
+    def test_missing_cell_still_fails_fast(self) -> None:
+        table = AdaptiveResponseTable()
+        table.update(0.0, 0.0, 1.0, 2.0, 3.0)
+
+        with self.assertRaises(MissingResponseStatistics):
+            table.lookup(0.2, 0.0)
+
+
+class ColdStartQuoteTests(unittest.TestCase):
+    def test_sequence_has_121_unique_cells(self) -> None:
+        quotes = cold_start_quotes()
+        self.assertEqual(len(quotes), 121)
+        self.assertEqual(len(set(quotes)), 121)
+
+    def test_first_eleven_quotes_are_diagonal(self) -> None:
+        quotes = cold_start_quotes()
+        expected = tuple((epsilon, epsilon) for epsilon in DEFAULT_EPSILON_GRID)
+        self.assertEqual(quotes[:11], expected)
+
+    def test_sequence_covers_complete_joint_grid(self) -> None:
+        quotes = cold_start_quotes()
+        expected = {
+            (epsilon_bid, epsilon_ask)
+            for epsilon_bid in DEFAULT_EPSILON_GRID
+            for epsilon_ask in DEFAULT_EPSILON_GRID
+        }
+        self.assertEqual(set(quotes), expected)
 
 
 if __name__ == "__main__":
