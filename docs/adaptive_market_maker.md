@@ -2,8 +2,7 @@
 
 This module is a paper-faithful but documented interpretation of Ganesh et al.
 (NeurIPS 2019). It implements deterministic decisions, online response updates,
-and a deterministic cold-start quote sequence. It is not connected to either
-simulator.
+a deterministic cold-start quote sequence, and minimal persistent probing.
 
 ## Response table
 
@@ -63,6 +62,19 @@ The remaining off-diagonal cells use bid-major, then ask-major grid order.
 This deterministic pass is an implementation choice: the paper does not define
 a cold-start or exploration policy. The function only returns quotes; it is not
 a scheduler, state machine, or adaptive exploration mechanism.
+
+## Persistent probing
+
+After cold start, `AdaptiveMarketMakerCompetitor` forces one symmetric diagonal
+quote every 100 adaptive steps. The quote advances deterministically through
+the epsilon grid in ascending round-robin order, beginning with `(-1, -1)`.
+Probe quotes bypass Step 1 and Step 2 so that the executed response updates the
+diagonal cell used by market-share targeting. The existing hedge objective is
+still evaluated using that fixed diagonal quote and the current inventory.
+
+The interval, diagonal-only support, round-robin order, and continued hedging
+are implementation choices. Probing does not change the EMA, cold-start values,
+or executed-cell-only update rule.
 
 ## Decisions
 

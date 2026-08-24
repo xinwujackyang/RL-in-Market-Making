@@ -310,6 +310,7 @@ class TwoDealerMarketEnv:
             info.update(
                 competitor_base_epsilon=float(self.competitor.last_base_epsilon),
                 competitor_cold_start=bool(self.competitor.last_action_was_cold_start),
+                competitor_probe=bool(self.competitor.last_action_was_probe),
             )
         reward = pnls[0].total if self.reward_mode == "total" else pnls[0].spread
         return self._observation(0), reward, False, info

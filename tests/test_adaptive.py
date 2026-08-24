@@ -249,6 +249,45 @@ class AdaptiveSimulatorIntegrationTests(unittest.TestCase):
         self.assertTrue(np.all(action[:2] <= 1.0))
         self.assertTrue(0.0 <= action[2] <= 1.0)
 
+    def test_persistent_probes_are_diagonal_round_robin_updates(self) -> None:
+        adaptive = AdaptiveMarketMakerCompetitor(
+            market_share_target=0.5,
+            risk_aversion=1.0,
+            probe_interval=100,
+        )
+        cfg = Config(order_size_mode="unit", sigma=0.0)
+        env = TwoDealerMarketEnv(adaptive, cfg, seed=102)
+        persistent_action = PersistentMarketMaker(0.5, 0.5, 0.0).act()
+
+        for _ in range(121):
+            env.step(persistent_action)
+        for _ in range(99):
+            _, _, _, info = env.step(persistent_action)
+            self.assertFalse(info["competitor_probe"])
+
+        before = adaptive.response_table.lookup(-1.0, -1.0)
+        _, _, _, first_probe = env.step(persistent_action)
+        after = adaptive.response_table.lookup(-1.0, -1.0)
+
+        self.assertTrue(first_probe["competitor_probe"])
+        self.assertEqual(first_probe["competitor_epsilon_bid"], -1.0)
+        self.assertEqual(first_probe["competitor_epsilon_ask"], -1.0)
+        self.assertTrue(0.0 <= first_probe["competitor_hedge_fraction"] <= 1.0)
+        self.assertAlmostEqual(
+            after.mean_gross_volume,
+            0.35 * before.mean_gross_volume
+            + 0.65 * first_probe["competitor_gross_volume"],
+        )
+
+        for _ in range(99):
+            _, _, _, info = env.step(persistent_action)
+            self.assertFalse(info["competitor_probe"])
+        _, _, _, second_probe = env.step(persistent_action)
+
+        self.assertTrue(second_probe["competitor_probe"])
+        self.assertAlmostEqual(second_probe["competitor_epsilon_bid"], -0.8)
+        self.assertAlmostEqual(second_probe["competitor_epsilon_ask"], -0.8)
+
 
 if __name__ == "__main__":
     unittest.main()

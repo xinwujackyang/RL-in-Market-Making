@@ -216,9 +216,13 @@ class AdaptiveMarketMakerCompetitor:
         self,
         market_share_target: float,
         risk_aversion: float,
+        probe_interval: int | None = 100,
     ) -> None:
+        if probe_interval is not None and probe_interval <= 0:
+            raise ValueError("probe_interval must be positive or None")
         self.market_share_target = float(market_share_target)
         self.risk_aversion = float(risk_aversion)
+        self.probe_interval = probe_interval
         self.reset_adaptive_state()
 
     def reset_adaptive_state(self) -> None:
@@ -230,9 +234,12 @@ class AdaptiveMarketMakerCompetitor:
         )
         self._cold_start_sequence = cold_start_quotes()
         self._cold_start_index = 0
+        self._probe_index = 0
+        self._adaptive_step = 0
         self.last_base_epsilon = float("nan")
         self.last_action = np.zeros(3, dtype=np.float32)
         self.last_action_was_cold_start = True
+        self.last_action_was_probe = False
 
     @property
     def cold_start_complete(self) -> bool:
@@ -254,12 +261,36 @@ class AdaptiveMarketMakerCompetitor:
             self._cold_start_index += 1
             self.last_base_epsilon = float("nan")
             self.last_action_was_cold_start = True
+            self.last_action_was_probe = False
             self.last_action = np.array(
                 [epsilon_bid, epsilon_ask, 0.0], dtype=np.float32
             )
             return self.last_action.copy()
 
         self.response_table.validate_complete()
+        self._adaptive_step += 1
+        if (
+            self.probe_interval is not None
+            and self._adaptive_step % self.probe_interval == 0
+        ):
+            epsilon = self.response_table.epsilon_grid[self._probe_index]
+            self._probe_index = (self._probe_index + 1) % len(
+                self.response_table.epsilon_grid
+            )
+            hedge_fraction = self.market_maker.select_hedge_fraction(
+                inventory=inventory,
+                final_quote=(epsilon, epsilon),
+                normal_volatility=normal_volatility,
+                hedge_spread=hedge_spread,
+            )
+            self.last_base_epsilon = epsilon
+            self.last_action_was_cold_start = False
+            self.last_action_was_probe = True
+            self.last_action = np.array(
+                [epsilon, epsilon, hedge_fraction], dtype=np.float32
+            )
+            return self.last_action.copy()
+
         decision = self.market_maker.decide(
             inventory=inventory,
             market_volume=previous_market_volume,
@@ -269,6 +300,7 @@ class AdaptiveMarketMakerCompetitor:
         )
         self.last_base_epsilon = decision.base_epsilon
         self.last_action_was_cold_start = False
+        self.last_action_was_probe = False
         self.last_action = decision.action
         return self.last_action.copy()
 
