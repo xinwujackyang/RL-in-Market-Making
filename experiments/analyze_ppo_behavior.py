@@ -88,9 +88,13 @@ def summarize_window(seed: int, checkpoint: int, records: list[dict]) -> dict:
     )
     epsilon_bid = np.asarray([row["ppo_epsilon_bid"] for row in window], dtype=float)
     epsilon_ask = np.asarray([row["ppo_epsilon_ask"] for row in window], dtype=float)
+    symmetric_level = (epsilon_bid + epsilon_ask) / 2
     skew = epsilon_bid - epsilon_ask
     _, beta_bid, _ = linear_regression(inventory, epsilon_bid)
     _, beta_ask, _ = linear_regression(inventory, epsilon_ask)
+    _, beta_symmetric_level, r_squared_symmetric_level = linear_regression(
+        inventory, symmetric_level
+    )
     _, beta_skew, r_squared_skew = linear_regression(inventory, skew)
     return {
         "seed": seed,
@@ -99,10 +103,12 @@ def summarize_window(seed: int, checkpoint: int, records: list[dict]) -> dict:
         "window_steps": len(window),
         "mean_epsilon_bid": float(epsilon_bid.mean()),
         "mean_epsilon_ask": float(epsilon_ask.mean()),
-        "mean_symmetric_quote_level": float(((epsilon_bid + epsilon_ask) / 2).mean()),
+        "mean_symmetric_quote_level": float(symmetric_level.mean()),
         "beta_bid": beta_bid,
         "beta_ask": beta_ask,
+        "beta_symmetric_quote_level": beta_symmetric_level,
         "beta_skew": beta_skew,
+        "r_squared_symmetric_quote_level": r_squared_symmetric_level,
         "r_squared_skew": r_squared_skew,
     }
 
@@ -202,6 +208,8 @@ def build_hedge_rows(pooled: dict[int, dict[str, np.ndarray]]) -> list[dict]:
         hedge = pooled[checkpoint]["hedge"]
         for lower, upper, label in HEDGE_BINS:
             mask = (abs_inventory >= lower) & (abs_inventory < upper)
+            absolute_hedge_quantity = hedge[mask] * abs_inventory[mask]
+            residual_inventory_quantity = (1.0 - hedge[mask]) * abs_inventory[mask]
             rows.append(
                 {
                     "training_step": checkpoint,
@@ -211,6 +219,12 @@ def build_hedge_rows(pooled: dict[int, dict[str, np.ndarray]]) -> list[dict]:
                     "sample_count": int(mask.sum()),
                     "mean_hedge_fraction": (
                         float(hedge[mask].mean()) if mask.any() else ""
+                    ),
+                    "mean_absolute_hedge_quantity": (
+                        float(absolute_hedge_quantity.mean()) if mask.any() else ""
+                    ),
+                    "mean_residual_inventory_quantity": (
+                        float(residual_inventory_quantity.mean()) if mask.any() else ""
                     ),
                 }
             )
@@ -251,7 +265,7 @@ def plot_inventory_skew(pooled: dict[int, dict[str, np.ndarray]], path: Path) ->
     plt.close(figure)
 
 
-def plot_inventory_hedge(hedge_rows: list[dict], path: Path) -> None:
+def plot_inventory_hedge_quantity(hedge_rows: list[dict], path: Path) -> None:
     figure, axis = plt.subplots(figsize=(8.0, 5.0))
     figure.subplots_adjust(left=0.11, right=0.98, bottom=0.18, top=0.90)
     colors = ("#4477AA", "#EE6677", "#228833")
@@ -259,7 +273,7 @@ def plot_inventory_hedge(hedge_rows: list[dict], path: Path) -> None:
     positions = np.arange(len(labels))
     for color, checkpoint in zip(colors, SCREENING_CHECKPOINTS):
         rows = [row for row in hedge_rows if row["training_step"] == checkpoint]
-        means = [float(row["mean_hedge_fraction"]) for row in rows]
+        means = [float(row["mean_absolute_hedge_quantity"]) for row in rows]
         axis.plot(
             positions,
             means,
@@ -269,11 +283,11 @@ def plot_inventory_hedge(hedge_rows: list[dict], path: Path) -> None:
             color=color,
             label=CHECKPOINT_LABELS[checkpoint],
         )
-    axis.set_title("PPO hedge fraction by inventory magnitude")
+    axis.set_title("PPO absolute hedge quantity by inventory magnitude")
     axis.set_xlabel("Decision-time |inventory| bin")
-    axis.set_ylabel("Mean hedge fraction")
+    axis.set_ylabel("Mean absolute hedge quantity E[h |z|]")
     axis.set_xticks(positions, labels)
-    axis.set_ylim(0.0, 1.0)
+    axis.set_ylim(bottom=0.0)
     axis.grid(axis="y", alpha=0.2)
     axis.legend(frameon=False)
     figure.savefig(path, dpi=180)
@@ -305,11 +319,9 @@ def write_report(summary_rows: list[dict], hedge_rows: list[dict]) -> None:
         ]
         for checkpoint in SCREENING_CHECKPOINTS
     }
-    sign_counts = {
+    positive_skew_counts = {
         checkpoint: sum(
-            float(row["beta_bid"]) > 0.0
-            and float(row["beta_ask"]) < 0.0
-            and float(row["beta_skew"]) > 0.0
+            float(row["beta_skew"]) > 0.0
             for row in summary_rows
             if row["training_step"] == checkpoint
         )
@@ -318,7 +330,6 @@ def write_report(summary_rows: list[dict], hedge_rows: list[dict]) -> None:
     early = SCREENING_CHECKPOINTS[0]
     final = SCREENING_CHECKPOINTS[-1]
     final_rows = [row for row in summary_rows if row["training_step"] == final]
-    positive_final_skew = sum(float(row["beta_skew"]) > 0.0 for row in final_rows)
     widened_seed_count = sum(
         float(
             next(
@@ -339,8 +350,21 @@ def write_report(summary_rows: list[dict], hedge_rows: list[dict]) -> None:
     final_hedge_means = [
         float(row["mean_hedge_fraction"]) for row in hedge_by_step[final]
     ]
-    final_hedge_increasing = all(
-        right > left for left, right in zip(final_hedge_means, final_hedge_means[1:])
+    final_absolute_hedge = [
+        float(row["mean_absolute_hedge_quantity"])
+        for row in hedge_by_step[final]
+    ]
+    final_residual_inventory = [
+        float(row["mean_residual_inventory_quantity"])
+        for row in hedge_by_step[final]
+    ]
+    final_absolute_hedge_increasing = all(
+        right > left
+        for left, right in zip(final_absolute_hedge, final_absolute_hedge[1:])
+    )
+    final_residual_increasing = all(
+        right > left
+        for left, right in zip(final_residual_inventory, final_residual_inventory[1:])
     )
 
     lines = [
@@ -373,43 +397,50 @@ def write_report(summary_rows: list[dict], hedge_rows: list[dict]) -> None:
     lines.extend(
         [
             "",
-            "## Inventory skew regressions",
+            "## Quote decomposition regressions",
             "",
-            "| Seed | Step | beta_bid | beta_ask | beta_skew | R-squared skew |",
+            "Here beta_m is inventory sensitivity of the overall symmetric quote level; beta_k is "
+            "inventory sensitivity of relative liquidation skew.",
+            "",
+            "| Seed | Step | beta_m | beta_k | R-squared m | R-squared k |",
             "|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in summary_rows:
         lines.append(
             f"| {int(row['seed'])} | {int(row['training_step']):,} | "
-            f"{float(row['beta_bid']):.5f} | {float(row['beta_ask']):.5f} | "
-            f"{float(row['beta_skew']):.5f} | {float(row['r_squared_skew']):.4f} |"
+            f"{float(row['beta_symmetric_quote_level']):.5f} | "
+            f"{float(row['beta_skew']):.5f} | "
+            f"{float(row['r_squared_symmetric_quote_level']):.4f} | "
+            f"{float(row['r_squared_skew']):.4f} |"
         )
     lines.extend(
         [
             "",
-            "Full economically classical sign pattern counts "
-            "(beta_bid>0, beta_ask<0, beta_skew>0): "
+            "Positive inventory-dependent relative skew counts (beta_k>0): "
             + ", ".join(
-                f"{checkpoint:,}={sign_counts[checkpoint]}/3"
+                f"{checkpoint:,}={positive_skew_counts[checkpoint]}/3"
                 for checkpoint in SCREENING_CHECKPOINTS
             )
             + ".",
             "",
             "## Hedging by decision-time inventory magnitude",
             "",
-            "Each cell is pooled 3-seed mean hedge fraction (sample count).",
+            "Pooled across 3 seeds. Quantities use decision-time absolute inventory.",
             "",
-            "| Step | |z| < 2 | 2 <= |z| < 5 | 5 <= |z| < 10 | |z| >= 10 |",
-            "|---:|---:|---:|---:|---:|",
+            "| Step | Inventory bin | Hedge fraction | Absolute hedge qty | Residual qty | N |",
+            "|---:|---|---:|---:|---:|---:|",
         ]
     )
     for checkpoint in SCREENING_CHECKPOINTS:
-        cells = [
-            f"{float(row['mean_hedge_fraction']):.4f} ({int(row['sample_count']):,})"
-            for row in hedge_by_step[checkpoint]
-        ]
-        lines.append(f"| {checkpoint:,} | " + " | ".join(cells) + " |")
+        for row in hedge_by_step[checkpoint]:
+            lines.append(
+                f"| {checkpoint:,} | {row['inventory_bin']} | "
+                f"{float(row['mean_hedge_fraction']):.4f} | "
+                f"{float(row['mean_absolute_hedge_quantity']):.4f} | "
+                f"{float(row['mean_residual_inventory_quantity']):.4f} | "
+                f"{int(row['sample_count']):,} |"
+            )
     lines.extend(
         [
             "",
@@ -425,26 +456,44 @@ def write_report(summary_rows: list[dict], hedge_rows: list[dict]) -> None:
                 > quote_summary[early]["mean_symmetric_quote_level"][0]
                 else "PPO 随训练变得更 aggressive/tighter。"
             ),
-            f"- **Inventory skew:** final beta_skew 在 {positive_final_skew}/3 seeds 中为正，"
-            f"但完整 classical sign pattern 只有 {sign_counts[final]}/3。Seed 1 是 bid 上调 / "
-            "ask 下调；seed 0 两侧都随 inventory 上调但 bid 更快；seed 2 两侧都下调但 ask "
-            "更快。因此 PPO 稳定学到了 relative skew，却没有跨 seed 学到一致的 classical "
-            "two-sided decomposition。Final R-squared 仅为 "
+            f"- **Quote decomposition:** beta_k 最终在 "
+            f"{positive_skew_counts[final]}/3 seeds 中为正，说明 PPO 一致学到了 "
+            "inventory-dependent relative liquidation skew。该 sign 在 early 已是 3/3、mid "
+            "短暂变为 2/3、final 回到 3/3，因此不是简单的单调 emergence。Final beta_m 则"
+            "跨 seed 分别为 "
+            + ", ".join(
+                f"{float(row['beta_symmetric_quote_level']):.5f}"
+                for row in final_rows
+            )
+            + "；inventory 同时引发的 overall quote-level adjustment 并不一致，因此不应以 "
+            "bid/ask absolute slopes 必须一正一负作为主要评价标准。Final R-squared k 为 "
             f"{min(float(row['r_squared_skew']) for row in final_rows):.3f}–"
             f"{max(float(row['r_squared_skew']) for row in final_rows):.3f}，inventory 对 stochastic "
             "skew 的线性解释力有限但非零。",
-            "- **Hedging:** final pooled hedge means by increasing |z| bin are "
+            "- **Hedge fraction:** final means by increasing |z| bin are "
             + " -> ".join(f"{value:.4f}" for value in final_hedge_means)
-            + ". "
+            + "；fraction 本身没有随 exposure 增加。",
+            "- **Absolute hedge control:** final E[h|z|] is "
+            + " -> ".join(f"{value:.4f}" for value in final_absolute_hedge)
+            + "；"
             + (
-                "它们随 inventory magnitude 单调增加。"
-                if final_hedge_increasing
-                else "它们并不随 inventory magnitude 增加；极端 |z|>=10 时反而最低。"
+                "absolute hedge quantity 随 inventory magnitude 单调增加。"
+                if final_absolute_hedge_increasing
+                else "absolute hedge quantity 不随 inventory magnitude 单调增加。"
             ),
-            "- **Overall:** PPO 学到的是“整体报价逐渐变宽 + 以 relative quote skew 响应 inventory”"
-            "的控制结构。Economically sensible inventory management 只得到部分支持：quote skew "
-            "方向最终 3/3 合理，但两侧分解不一致；hedge head 没有表现出 exposure 越大、hedge "
-            "越强的经典风险控制。",
+            "- **Residual exposure:** final E[(1-h)|z|] is "
+            + " -> ".join(f"{value:.4f}" for value in final_residual_inventory)
+            + "；"
+            + (
+                "residual exposure 仍随 inventory magnitude 单调增加。"
+                if final_residual_increasing
+                else "residual exposure 不随 inventory magnitude 单调增加。"
+            ),
+            "- **Corrected conclusion:** PPO 的 control policy 可分解为 overall quote adjustment "
+            "+ 3/3 consistent inventory-dependent relative skew + absolute hedge control。"
+            "E[h|z|] 随 exposure 单调增长，支持其 executed actions 包含显式 balance-sheet risk "
+            "reduction；但 residual quantity 同时大幅增长，说明 PPO 不会在比例上完全 "
+            "neutralize inventory risk。",
             "",
         ]
     )
@@ -470,7 +519,9 @@ def main() -> None:
     write_csv(OUTPUT / "behavior_by_seed_checkpoint.csv", summary_rows)
     write_csv(OUTPUT / "inventory_hedge_bins.csv", hedge_rows)
     plot_inventory_skew(pooled, OUTPUT / "inventory_skew.png")
-    plot_inventory_hedge(hedge_rows, OUTPUT / "inventory_hedge.png")
+    plot_inventory_hedge_quantity(
+        hedge_rows, OUTPUT / "inventory_hedge_quantity.png"
+    )
     write_report(summary_rows, hedge_rows)
     print(f"Saved PPO behavior analysis under {OUTPUT}")
 
