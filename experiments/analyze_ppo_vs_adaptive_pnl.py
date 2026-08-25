@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ from adaptive import AdaptiveMarketMakerCompetitor
 from ppo_vs_adaptive import (
     CHECKPOINT_WINDOW,
     FAST_PROBE_INTERVAL,
+    LONGRUN_CHECKPOINTS,
     SCREENING_CHECKPOINTS,
     RecordingAdaptiveEnv,
     initialize_and_calibrate,
@@ -32,6 +34,7 @@ from ppo_vs_adaptive import (
 
 
 OUTPUT = ROOT / "results" / "ppo_vs_adaptive_pnl"
+LONGRUN_OUTPUT = ROOT / "results" / "ppo_vs_adaptive_probe20_longrun"
 REFERENCE_TRAJECTORY = (
     ROOT
     / "results"
@@ -113,6 +116,12 @@ def summarize_agent_window(
     market_share = np.asarray(
         [row[f"{prefix}_market_share"] for row in window], dtype=float
     )
+    epsilon_bid = np.asarray(
+        [row[f"{prefix}_epsilon_bid"] for row in window], dtype=float
+    )
+    epsilon_ask = np.asarray(
+        [row[f"{prefix}_epsilon_ask"] for row in window], dtype=float
+    )
     if not np.allclose(spread + inventory_pnl - hedge_cost, total, rtol=0.0, atol=1e-12):
         raise RuntimeError(f"{agent} aggregate source contains a PnL identity failure")
     captured_volume = float(volume.sum())
@@ -132,11 +141,17 @@ def summarize_agent_window(
         "hedge_cost_per_step": float(hedge_cost.mean()),
         "total_pnl_per_step": float(total.mean()),
         "mean_abs_inventory": float(np.abs(inventory).mean()),
+        "mean_symmetric_quote_level": float(((epsilon_bid + epsilon_ask) / 2).mean()),
     }
 
 
-def run_seed(seed: int) -> list[dict]:
-    cfg = make_config(seed, ROLLOUTS, HORIZON)
+def run_seed(
+    seed: int,
+    *,
+    rollouts: int = ROLLOUTS,
+    checkpoints: tuple[int, ...] = SCREENING_CHECKPOINTS,
+) -> list[dict]:
+    cfg = make_config(seed, rollouts, HORIZON)
     agent, calibrated_statistics, calibration = initialize_and_calibrate(cfg, seed)
     if calibration["calibration_steps"] != 1_210:
         raise RuntimeError("unexpected calibration length")
@@ -162,11 +177,11 @@ def run_seed(seed: int) -> list[dict]:
         expected_reset_calls=2,
         expected_cold_start_steps=0,
     )
-    if cold_start_steps != 0 or probe_steps != 5_017:
+    if cold_start_steps != 0 or probe_steps != cfg.total_steps // FAST_PROBE_INTERVAL:
         raise RuntimeError("formal adaptive lifecycle differs from Phase 8")
     return [
         summarize_agent_window(seed, checkpoint, agent_name, environment.records)
-        for checkpoint in SCREENING_CHECKPOINTS
+        for checkpoint in checkpoints
         for agent_name in AGENTS
     ]
 
@@ -436,24 +451,271 @@ def write_report(rows: list[dict]) -> None:
     (OUTPUT / "report_zh.md").write_text("\n".join(lines))
 
 
+def checkpoint_mean_std(
+    rows: list[dict], checkpoint: int, agent: str, metric: str
+) -> tuple[float, float]:
+    values = np.asarray(
+        [
+            float(row[metric])
+            for row in rows
+            if row["training_step"] == checkpoint and row["agent"] == agent
+        ],
+        dtype=float,
+    )
+    return float(values.mean()), float(values.std())
+
+
+def plot_longrun_economics(rows: list[dict], path: Path) -> None:
+    figure, axis = plt.subplots(figsize=(8.0, 5.0))
+    figure.subplots_adjust(left=0.12, right=0.98, bottom=0.16, top=0.89)
+    x_values = np.asarray(LONGRUN_CHECKPOINTS, dtype=float)
+    for color, marker, agent in (
+        ("#4477AA", "o", "PPO"),
+        ("#EE6677", "s", "Adaptive"),
+    ):
+        statistics = [
+            checkpoint_mean_std(rows, checkpoint, agent, "total_pnl_per_step")
+            for checkpoint in LONGRUN_CHECKPOINTS
+        ]
+        axis.errorbar(
+            x_values,
+            [value[0] for value in statistics],
+            yerr=[value[1] for value in statistics],
+            color=color,
+            marker=marker,
+            linewidth=2.0,
+            markersize=6,
+            capsize=4,
+            label=agent,
+        )
+    axis.set_title("Long-run PPO vs Adaptive total PnL")
+    axis.set_xlabel("Formal training step")
+    axis.set_ylabel("Mean total PnL per environment step")
+    axis.set_xticks(
+        x_values, [f"{checkpoint / 1_000:.0f}k" for checkpoint in LONGRUN_CHECKPOINTS]
+    )
+    axis.grid(alpha=0.2)
+    axis.legend(frameon=False)
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+
+
+def write_longrun_report(rows: list[dict], output: Path) -> None:
+    final = LONGRUN_CHECKPOINTS[-1]
+    comparison_checkpoints = (100_352, 150_528, final)
+    final_statistics_by_agent = {
+        agent: {
+            metric: checkpoint_mean_std(rows, final, agent, metric)
+            for metric in FINAL_METRICS
+        }
+        for agent in AGENTS
+    }
+    delta = {
+        metric: final_statistics_by_agent["PPO"][metric][0]
+        - final_statistics_by_agent["Adaptive"][metric][0]
+        for metric in FINAL_METRICS
+    }
+    final_rows = sorted(
+        (row for row in rows if row["training_step"] == final),
+        key=lambda row: (int(row["seed"]), row["agent"]),
+    )
+    final_seed_totals = {
+        int(row["seed"]): {
+            agent_row["agent"]: float(agent_row["total_pnl_per_step"])
+            for agent_row in final_rows
+            if int(agent_row["seed"]) == int(row["seed"])
+        }
+        for row in final_rows
+    }
+    ppo_total_wins = sum(
+        values["PPO"] > values["Adaptive"] for values in final_seed_totals.values()
+    )
+    ppo_paths = {
+        metric: [
+            checkpoint_mean_std(rows, checkpoint, "PPO", metric)
+            for checkpoint in comparison_checkpoints
+        ]
+        for metric in (
+            "market_share",
+            "spread_pnl_per_captured_unit",
+            "spread_pnl_per_step",
+            "total_pnl_per_step",
+            "mean_symmetric_quote_level",
+        )
+    }
+    labels = {
+        "market_share": "市场份额",
+        "spread_pnl_per_step": "Spread PnL/step",
+        "spread_pnl_per_captured_unit": "Spread PnL/captured unit",
+        "inventory_pnl_per_step": "Inventory PnL/step",
+        "hedge_cost_per_step": "Hedge cost/step",
+        "total_pnl_per_step": "Total PnL/step",
+        "mean_abs_inventory": "平均绝对库存",
+    }
+    lines = [
+        "# PPO vs 稳定 Adaptive MM：204,800-step confirmation",
+        "",
+        "## 设置与完整性检查",
+        "",
+        "除 formal horizon 外，Phase 11 设置保持不变：3 seeds x 200 rollouts x 1,024 = "
+        "204,800 steps。每个 seed 使用 1,210 calibration steps、完整 121 cells、formal cold "
+        "start=0、probe interval=20（10,240 probe steps，严格为 5%）。100,352 checkpoint "
+        "在绝对误差 1e-12 内复现 Phase 8/11 指标；每一步均满足 Spread + Inventory - "
+        "HedgeCost = Total。",
+        "",
+        "## PPO 轨迹：3-seed mean（population std）",
+        "",
+        "| Step | Share | Spread/unit | Spread/step | Total PnL/step | 平均绝对库存 | Mean m |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for checkpoint in LONGRUN_CHECKPOINTS:
+        values = {
+            metric: checkpoint_mean_std(rows, checkpoint, "PPO", metric)
+            for metric in (
+                "market_share",
+                "spread_pnl_per_captured_unit",
+                "spread_pnl_per_step",
+                "total_pnl_per_step",
+                "mean_abs_inventory",
+                "mean_symmetric_quote_level",
+            )
+        }
+        lines.append(
+            f"| {checkpoint:,} | {render_mean_std(values['market_share'])} | "
+            f"{render_mean_std(values['spread_pnl_per_captured_unit'])} | "
+            f"{render_mean_std(values['spread_pnl_per_step'])} | "
+            f"{render_mean_std(values['total_pnl_per_step'])} | "
+            f"{render_mean_std(values['mean_abs_inventory'], 3)} | "
+            f"{render_mean_std(values['mean_symmetric_quote_level'])} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Adaptive 轨迹：3-seed mean（population std）",
+            "",
+            "| Step | Share | Spread/unit | Spread/step | Total PnL/step |",
+            "|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for checkpoint in LONGRUN_CHECKPOINTS:
+        values = {
+            metric: checkpoint_mean_std(rows, checkpoint, "Adaptive", metric)
+            for metric in (
+                "market_share",
+                "spread_pnl_per_captured_unit",
+                "spread_pnl_per_step",
+                "total_pnl_per_step",
+            )
+        }
+        lines.append(
+            f"| {checkpoint:,} | {render_mean_std(values['market_share'])} | "
+            f"{render_mean_std(values['spread_pnl_per_captured_unit'])} | "
+            f"{render_mean_std(values['spread_pnl_per_step'])} | "
+            f"{render_mean_std(values['total_pnl_per_step'])} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## 204,800-step 最终比较",
+            "",
+            "| 指标 | PPO | Adaptive | PPO - Adaptive |",
+            "|---|---:|---:|---:|",
+        ]
+    )
+    for metric in FINAL_METRICS:
+        lines.append(
+            f"| {labels[metric]} | "
+            f"{render_mean_std(final_statistics_by_agent['PPO'][metric])} | "
+            f"{render_mean_std(final_statistics_by_agent['Adaptive'][metric])} | "
+            f"{delta[metric]:.4f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## 最终结果（按 seed）",
+            "",
+            "| Seed | Agent | 市场份额 | Total PnL/step |",
+            "|---:|---|---:|---:|",
+        ]
+    )
+    for row in final_rows:
+        lines.append(
+            f"| {int(row['seed'])} | {row['agent']} | "
+            f"{float(row['market_share']):.4f} | "
+            f"{float(row['total_pnl_per_step']):.4f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## 结论",
+            "",
+            "**分类：Case A。** 从 100,352 到 150,528 再到 204,800，PPO 市场份额为 "
+            f"{ppo_paths['market_share'][0][0]:.4f} -> "
+            f"{ppo_paths['market_share'][1][0]:.4f} -> {ppo_paths['market_share'][2][0]:.4f}, "
+            "同时每单位 captured volume 的 spread PnL 为 "
+            f"{ppo_paths['spread_pnl_per_captured_unit'][0][0]:.4f} -> "
+            f"{ppo_paths['spread_pnl_per_captured_unit'][1][0]:.4f} -> "
+            f"{ppo_paths['spread_pnl_per_captured_unit'][2][0]:.4f}。PPO 最终收回成交量，同时没有放弃"
+            "其较高的单位成交 realized margin。",
+            "",
+            f"PPO total PnL/step 上升为 {ppo_paths['total_pnl_per_step'][0][0]:.4f} -> "
+            f"{ppo_paths['total_pnl_per_step'][1][0]:.4f} -> "
+            f"{ppo_paths['total_pnl_per_step'][2][0]:.4f}；mean symmetric quote level 上升为 "
+            f"{ppo_paths['mean_symmetric_quote_level'][0][0]:.4f} -> "
+            f"{ppo_paths['mean_symmetric_quote_level'][1][0]:.4f} -> "
+            f"{ppo_paths['mean_symmetric_quote_level'][2][0]:.4f}。最终 checkpoint 中，PPO 在 "
+            f"{ppo_total_wins}/3 条 seed 路径上取得更高 total PnL。其平均 total-PnL 优势 "
+            f"{delta['total_pnl_per_step']:.4f} 分解为 spread "
+            f"{delta['spread_pnl_per_step']:.4f} + inventory "
+            f"{delta['inventory_pnl_per_step']:.4f} - hedge-cost 差 "
+            f"{delta['hedge_cost_per_step']:.4f}；优势来自 spread/margin-volume，而不是更高的 "
+            "inventory PnL 或更低的 hedging cost。",
+            "",
+            "**尚未出现 plateau。** 到 204,800 时，share、quote level、spread/unit 和 total PnL "
+            "仍在显著变化，同时 late training 的 cross-seed dispersion 急剧扩大（PPO "
+            f"total-PnL std {ppo_paths['total_pnl_per_step'][0][1]:.4f} -> "
+            f"{ppo_paths['total_pnl_per_step'][1][1]:.4f} -> "
+            f"{ppo_paths['total_pnl_per_step'][2][1]:.4f}）。Long-run evidence 支持更好的 PPO "
+            "economics regime，但不支持 policy/economic convergence。按照 stop rule，实验在 "
+            "204,800 停止，不自动继续训练。",
+            "",
+        ]
+    )
+    (output / "report_zh.md").write_text("\n".join(lines))
+
+
 def main() -> None:
-    OUTPUT.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Analyze PPO-vs-Adaptive realized economics")
+    parser.add_argument("--longrun", action="store_true")
+    args = parser.parse_args()
+    output = LONGRUN_OUTPUT if args.longrun else OUTPUT
+    rollouts = 200 if args.longrun else ROLLOUTS
+    checkpoints = LONGRUN_CHECKPOINTS if args.longrun else SCREENING_CHECKPOINTS
+    output.mkdir(parents=True, exist_ok=True)
     rows = []
     for seed in SEEDS:
-        print(f"Decomposing PPO vs Adaptive PnL seed={seed}", flush=True)
-        rows.extend(run_seed(seed))
+        print(
+            f"Decomposing PPO vs Adaptive PnL seed={seed} longrun={args.longrun}",
+            flush=True,
+        )
+        rows.extend(run_seed(seed, rollouts=rollouts, checkpoints=checkpoints))
         print(f"Finished seed={seed}", flush=True)
     verify_phase8_reproduction(rows)
     if not all(
         np.isfinite(float(row[metric]))
         for row in rows
-        for metric in FINAL_METRICS
+        for metric in (*FINAL_METRICS, "mean_symmetric_quote_level")
     ):
         raise RuntimeError("PnL summary contains NaN or infinite values")
-    write_csv(OUTPUT / "pnl_by_seed_checkpoint.csv", rows)
-    plot_final_decomposition(rows, OUTPUT / "pnl_decomposition.png")
-    write_report(rows)
-    print(f"Saved PPO-vs-Adaptive PnL analysis under {OUTPUT}")
+    if args.longrun:
+        write_csv(output / "metrics_by_seed_checkpoint.csv", rows)
+        plot_longrun_economics(rows, output / "longrun_economics.png")
+        write_longrun_report(rows, output)
+    else:
+        write_csv(output / "pnl_by_seed_checkpoint.csv", rows)
+        plot_final_decomposition(rows, output / "pnl_decomposition.png")
+        write_report(rows)
+    print(f"Saved PPO-vs-Adaptive PnL analysis under {output}")
 
 
 if __name__ == "__main__":
