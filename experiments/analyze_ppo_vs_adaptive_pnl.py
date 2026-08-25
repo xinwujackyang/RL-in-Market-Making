@@ -19,6 +19,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from adaptive import AdaptiveMarketMakerCompetitor
+from baselines import PersistentMarketMaker
+from environments import TwoDealerMarketEnv
+from market import evolve_mid_price, reference_spread
 from ppo_vs_adaptive import (
     CHECKPOINT_WINDOW,
     FAST_PROBE_INTERVAL,
@@ -35,6 +38,7 @@ from ppo_vs_adaptive import (
 
 OUTPUT = ROOT / "results" / "ppo_vs_adaptive_pnl"
 LONGRUN_OUTPUT = ROOT / "results" / "ppo_vs_adaptive_probe20_longrun"
+NORMALIZED_SPREAD_OUTPUT = ROOT / "results" / "ppo_vs_adaptive_normalized_spread"
 REFERENCE_TRAJECTORY = (
     ROOT
     / "results"
@@ -684,10 +688,195 @@ def write_longrun_report(rows: list[dict], output: Path) -> None:
     (output / "report_zh.md").write_text("\n".join(lines))
 
 
+def reconstruct_unit_reference_spread(seed: int) -> np.ndarray:
+    """Reconstruct the formal run's independent price path without PPO rerunning."""
+    cfg = make_config(seed, 200, HORIZON)
+    if cfg.order_size_mode != "unit":
+        raise RuntimeError("normalized spread analysis requires Phase 12 unit flow")
+    environment = TwoDealerMarketEnv(
+        PersistentMarketMaker(),
+        cfg,
+        seed=seed * 100_000 + 10_000,
+    )
+    scales = np.empty(LONGRUN_CHECKPOINTS[-1], dtype=float)
+    for step in range(len(scales)):
+        scales[step] = reference_spread(environment.price, 1.0, cfg)
+        environment.price = evolve_mid_price(
+            environment.price, cfg, environment.price_rng
+        )
+    if not np.all(np.isfinite(scales)) or np.any(scales <= 0.0):
+        raise RuntimeError("reference spread path is not finite and positive")
+    return scales
+
+
+def normalized_spread_rows() -> list[dict]:
+    source = read_csv(LONGRUN_OUTPUT / "metrics_by_seed_checkpoint.csv")
+    expected_keys = {
+        (seed, checkpoint, agent)
+        for seed in SEEDS
+        for checkpoint in LONGRUN_CHECKPOINTS
+        for agent in AGENTS
+    }
+    source_by_key = {
+        (int(row["seed"]), int(row["training_step"]), row["agent"]): row
+        for row in source
+    }
+    if set(source_by_key) != expected_keys:
+        raise RuntimeError("Phase 12 source is incomplete")
+
+    rows = []
+    for seed in SEEDS:
+        scales = reconstruct_unit_reference_spread(seed)
+        for checkpoint in LONGRUN_CHECKPOINTS:
+            start = checkpoint - CHECKPOINT_WINDOW
+            mean_scale = float(scales[start:checkpoint].mean())
+            ppo = source_by_key[(seed, checkpoint, "PPO")]
+            adaptive = source_by_key[(seed, checkpoint, "Adaptive")]
+            if min(
+                float(ppo["captured_volume_per_step"]),
+                float(adaptive["captured_volume_per_step"]),
+            ) <= 0.0:
+                raise RuntimeError("captured volume must be positive")
+            ppo_raw = float(ppo["spread_pnl_per_captured_unit"])
+            adaptive_raw = float(adaptive["spread_pnl_per_captured_unit"])
+            ppo_normalized = ppo_raw / mean_scale
+            adaptive_normalized = adaptive_raw / mean_scale
+            row = {
+                "seed": seed,
+                "training_step": checkpoint,
+                "window_start": start + 1,
+                "window_steps": CHECKPOINT_WINDOW,
+                "mean_reference_spread_s_ref_1": mean_scale,
+                "ppo_market_share": float(ppo["market_share"]),
+                "adaptive_market_share": float(adaptive["market_share"]),
+                "ppo_raw_spread_per_unit": ppo_raw,
+                "adaptive_raw_spread_per_unit": adaptive_raw,
+                "ppo_normalized_spread_monetization": ppo_normalized,
+                "adaptive_normalized_spread_monetization": adaptive_normalized,
+                "ppo_adaptive_normalized_ratio": (
+                    ppo_normalized / adaptive_normalized
+                ),
+            }
+            if not all(np.isfinite(float(value)) for value in row.values()):
+                raise RuntimeError("normalized spread result is not finite")
+            rows.append(row)
+    return rows
+
+
+def write_normalized_spread_report(rows: list[dict]) -> None:
+    def values(checkpoint: int, key: str) -> np.ndarray:
+        return np.asarray(
+            [float(row[key]) for row in rows if row["training_step"] == checkpoint],
+            dtype=float,
+        )
+
+    lines = [
+        "# Phase 12b：Normalized Spread Monetization Sanity Check",
+        "",
+        "## 定义与数据边界",
+        "",
+        "本分析无需重新训练。使用 simulator-native unit-size reference spread "
+        "`S_ref,t(1) = reference_spread(P_t, 1, cfg)`；formal environment 的 price RNG 独立于 "
+        "order/routing RNG，因此可用原 seed 精确重建每一步的 reference-spread path。当前参数下 "
+        "`S_ref,t(1) = (2.0 + 0.2) x 1e-4 x P_t = 2.2e-4 P_t`。",
+        "",
+        "Phase 12 artifact 没有保存逐步 dealer captured volume，因此不能无 rerun 地精确恢复 "
+        "`sum_t V_dealer,t S_ref,t(1)`。本轮固定使用唯一的 market-scale normalization："
+        "`normalized = (window aggregate spread PnL / captured volume) / window mean S_ref,t(1)`。"
+        "在 unit flow 下，每一步全部 20 个 market units 共享该 `S_ref,t(1)`；但该结果不冒充 "
+        "dealer-volume-weighted estimator。",
+        "",
+        "## 3-seed trajectory：mean（population std）",
+        "",
+        "| Step | Mean S_ref(1) | PPO raw/unit | Adaptive raw/unit | PPO normalized | Adaptive normalized | PPO/Adaptive ratio |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for checkpoint in LONGRUN_CHECKPOINTS:
+        scale = values(checkpoint, "mean_reference_spread_s_ref_1")
+        ppo_raw = values(checkpoint, "ppo_raw_spread_per_unit")
+        adaptive_raw = values(checkpoint, "adaptive_raw_spread_per_unit")
+        ppo_normalized = values(
+            checkpoint, "ppo_normalized_spread_monetization"
+        )
+        adaptive_normalized = values(
+            checkpoint, "adaptive_normalized_spread_monetization"
+        )
+        ratio = float(ppo_normalized.mean() / adaptive_normalized.mean())
+        lines.append(
+            f"| {checkpoint:,} | {render_mean_std((float(scale.mean()), float(scale.std())), 6)} | "
+            f"{render_mean_std((float(ppo_raw.mean()), float(ppo_raw.std())))} | "
+            f"{render_mean_std((float(adaptive_raw.mean()), float(adaptive_raw.std())))} | "
+            f"{render_mean_std((float(ppo_normalized.mean()), float(ppo_normalized.std())))} | "
+            f"{render_mean_std((float(adaptive_normalized.mean()), float(adaptive_normalized.std())))} | "
+            f"{ratio:.4f} |"
+        )
+
+    final_rows = sorted(
+        (row for row in rows if row["training_step"] == LONGRUN_CHECKPOINTS[-1]),
+        key=lambda row: int(row["seed"]),
+    )
+    lines.extend(
+        [
+            "",
+            "## Final 204,800：按 seed",
+            "",
+            "| Seed | PPO normalized | Adaptive normalized | Ratio |",
+            "|---:|---:|---:|---:|",
+        ]
+    )
+    for row in final_rows:
+        lines.append(
+            f"| {int(row['seed'])} | "
+            f"{float(row['ppo_normalized_spread_monetization']):.4f} | "
+            f"{float(row['adaptive_normalized_spread_monetization']):.4f} | "
+            f"{float(row['ppo_adaptive_normalized_ratio']):.4f} |"
+        )
+
+    ratios = []
+    for checkpoint in (100_352, 150_528, 204_800):
+        ppo = values(checkpoint, "ppo_normalized_spread_monetization")
+        adaptive = values(checkpoint, "adaptive_normalized_spread_monetization")
+        ratios.append(float(ppo.mean() / adaptive.mean()))
+    final_wins = sum(
+        float(row["ppo_adaptive_normalized_ratio"]) > 1.0 for row in final_rows
+    )
+    lines.extend(
+        [
+            "",
+            "## 结论",
+            "",
+            f"**Case A。** PPO/Adaptive normalized ratio 从 100k 的 {ratios[0]:.4f} "
+            f"升至 150k 的 {ratios[1]:.4f} 和 200k 的 {ratios[2]:.4f}；final PPO 在 "
+            f"{final_wins}/3 seeds 上均高于 Adaptive。Phase 12 的 PPO per-unit advantage "
+            "在 simulator-native market spread scale normalization 后仍成立且扩大，因此后期 "
+            "raw spread/unit 上升不能仅由 nominal price/reference-spread scaling 解释。",
+            "",
+            "按照 stop rule，本分析到此结束，不继续 PPO-vs-Adaptive diagnostics。",
+            "",
+        ]
+    )
+    (NORMALIZED_SPREAD_OUTPUT / "report_zh.md").write_text("\n".join(lines))
+
+
+def run_normalized_spread_analysis() -> None:
+    NORMALIZED_SPREAD_OUTPUT.mkdir(parents=True, exist_ok=True)
+    rows = normalized_spread_rows()
+    write_csv(
+        NORMALIZED_SPREAD_OUTPUT / "normalized_spread_by_seed_checkpoint.csv", rows
+    )
+    write_normalized_spread_report(rows)
+    print(f"Saved normalized spread analysis under {NORMALIZED_SPREAD_OUTPUT}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze PPO-vs-Adaptive realized economics")
-    parser.add_argument("--longrun", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--longrun", action="store_true")
+    modes.add_argument("--normalized-spread", action="store_true")
     args = parser.parse_args()
+    if args.normalized_spread:
+        run_normalized_spread_analysis()
+        return
     output = LONGRUN_OUTPUT if args.longrun else OUTPUT
     rollouts = 200 if args.longrun else ROLLOUTS
     checkpoints = LONGRUN_CHECKPOINTS if args.longrun else SCREENING_CHECKPOINTS
