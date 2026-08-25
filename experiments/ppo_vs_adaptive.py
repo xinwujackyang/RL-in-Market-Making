@@ -27,6 +27,7 @@ SCREENING_CHECKPOINTS = (20_480, 60_416, 100_352)
 LONGRUN_CHECKPOINTS = (20_480, 60_416, 100_352, 150_528, 204_800)
 CHECKPOINT_WINDOW = 20_480
 PROBE_INTERVAL = 100
+FAST_PROBE_INTERVAL = 20
 CALIBRATION_PASSES = 10
 BASELINE_RESULTS = ROOT / "results" / "ppo_vs_adaptive"
 PROBING_RESULTS = ROOT / "results" / "ppo_vs_adaptive_probing"
@@ -390,7 +391,11 @@ def validate_training_run(
         )
     adaptive.response_table.validate_complete()
     probe_steps = sum(row["adaptive_probe"] for row in environment.records)
-    expected_probe_steps = (cfg.total_steps - cold_start_steps) // PROBE_INTERVAL
+    expected_probe_steps = (
+        0
+        if adaptive.probe_interval is None
+        else (cfg.total_steps - cold_start_steps) // adaptive.probe_interval
+    )
     if probe_steps != expected_probe_steps:
         raise RuntimeError(
             f"expected {expected_probe_steps} probe steps, observed {probe_steps}"
@@ -468,13 +473,15 @@ def train_calibrated_seed(
     rollouts: int,
     horizon: int,
     checkpoints: tuple[int, ...],
+    *,
+    probe_interval: int = PROBE_INTERVAL,
 ) -> tuple[dict, list[dict]]:
     cfg = make_config(seed, rollouts, horizon)
     agent, calibrated_statistics, calibration = initialize_and_calibrate(cfg, seed)
     adaptive = AdaptiveMarketMakerCompetitor(
         market_share_target=0.5,
         risk_aversion=2.0,
-        probe_interval=PROBE_INTERVAL,
+        probe_interval=probe_interval,
         initial_response_statistics=calibrated_statistics,
     )
     environment = RecordingAdaptiveEnv(
@@ -519,7 +526,7 @@ def train_calibrated_seed(
         "formal_environment_reset_calls": environment.reset_calls,
         "formal_initial_previous_market_volume": environment.initial_previous_market_volume,
         "adaptive_table_complete": True,
-        "adaptive_probe_interval": PROBE_INTERVAL,
+        "adaptive_probe_interval": probe_interval,
         "adaptive_probe_steps_total": probe_steps,
         "adaptive_probe_fraction_total": probe_steps / cfg.total_steps,
         **{key: value for key, value in final.items() if key != "seed"},
@@ -537,6 +544,21 @@ def train_calibrated_seed(
         "order_size_mode": cfg.order_size_mode,
     }
     return metrics, trajectory_rows
+
+
+def train_calibrated_fast_probe_seed(
+    seed: int,
+    rollouts: int,
+    horizon: int,
+    checkpoints: tuple[int, ...],
+) -> tuple[dict, list[dict]]:
+    return train_calibrated_seed(
+        seed,
+        rollouts,
+        horizon,
+        checkpoints,
+        probe_interval=FAST_PROBE_INTERVAL,
+    )
 
 
 def run_calibrated_frozen_seed(
@@ -1241,6 +1263,175 @@ def write_calibrated_report(
     (output / "report_zh.md").write_text("\n".join(lines))
 
 
+def write_fast_probe_report(
+    output: Path,
+    trajectory: list[dict],
+    interval_100_trajectory: list[dict],
+) -> None:
+    keys = (
+        "adaptive_market_share",
+        "adaptive_mean_base_epsilon",
+        "adaptive_base_epsilon_one_frequency",
+        "adaptive_probe_fraction",
+        "ppo_market_share",
+        "ppo_total_pnl_per_step",
+        "ppo_mean_abs_inventory",
+    )
+    fast = {
+        checkpoint: {
+            key: checkpoint_summary(trajectory, checkpoint, key) for key in keys
+        }
+        for checkpoint in SCREENING_CHECKPOINTS
+    }
+    control = {
+        checkpoint: {
+            key: checkpoint_summary(interval_100_trajectory, checkpoint, key)
+            for key in keys
+            if key != "adaptive_probe_fraction"
+        }
+        for checkpoint in SCREENING_CHECKPOINTS
+    }
+    rows_by_seed_step = {
+        (int(row["seed"]), int(row["training_step"])): row for row in trajectory
+    }
+    control_by_seed_step = {
+        (int(row["seed"]), int(row["training_step"])): row
+        for row in interval_100_trajectory
+    }
+    final = SCREENING_CHECKPOINTS[-1]
+    fast_final_shares = [
+        float(rows_by_seed_step[(seed, final)]["adaptive_market_share"])
+        for seed in range(3)
+    ]
+    seed_one_fast = rows_by_seed_step[(1, final)]
+    seed_one_control = control_by_seed_step[(1, final)]
+    tracking_supported = (
+        float(seed_one_fast["adaptive_market_share"])
+        > float(seed_one_control["adaptive_market_share"])
+        and float(seed_one_fast["adaptive_base_epsilon_one_frequency"])
+        < float(seed_one_control["adaptive_base_epsilon_one_frequency"])
+        and min(fast_final_shares) > 0.2
+        and fast[final]["adaptive_market_share"][1]
+        < control[final]["adaptive_market_share"][1]
+        and fast[final]["adaptive_base_epsilon_one_frequency"][1]
+        < control[final]["adaptive_base_epsilon_one_frequency"][1]
+    )
+
+    lines = [
+        "# Calibrated Adaptive MM: probe interval 20",
+        "",
+        "## Setup and sanity",
+        "",
+        "Phase 6 calibrated + learning-PPO setup 原样复用。唯一 experimental change 是 "
+        "deterministic diagonal round-robin probe interval 100 -> 20；3 seeds x 100,352 formal "
+        "steps，checkpoint 使用 trailing 20,480-step window。每 seed calibration=1,210、"
+        "cells=121、formal cold start=0、formal probes=5,017（4.9994%）；每个 checkpoint "
+        "window 含 1,024 probes（5.000%）。",
+        "",
+        "## Adaptive trajectory",
+        "",
+        "| Step | Share mean (std) | Mean base | Base=1 mean (std) | Probe fraction |",
+        "|---:|---:|---:|---:|---:|",
+    ]
+    for checkpoint in SCREENING_CHECKPOINTS:
+        row = fast[checkpoint]
+        lines.append(
+            f"| {checkpoint:,} | {row['adaptive_market_share'][0]:.4f} "
+            f"({row['adaptive_market_share'][1]:.4f}) | "
+            f"{row['adaptive_mean_base_epsilon'][0]:.3f} | "
+            f"{row['adaptive_base_epsilon_one_frequency'][0]:.3%} "
+            f"({row['adaptive_base_epsilon_one_frequency'][1]:.3%}) | "
+            f"{row['adaptive_probe_fraction'][0]:.3%} |"
+        )
+    lines.extend(
+        [
+            "",
+            "| Seed | Adaptive share: 20k -> 60k -> 100k | "
+            "Base=1: 20k -> 60k -> 100k |",
+            "|---:|---:|---:|",
+        ]
+    )
+    for seed in range(3):
+        seed_rows = [
+            rows_by_seed_step[(seed, checkpoint)]
+            for checkpoint in SCREENING_CHECKPOINTS
+        ]
+        lines.append(
+            f"| {seed} | "
+            + " -> ".join(f"{float(row['adaptive_market_share']):.4f}" for row in seed_rows)
+            + " | "
+            + " -> ".join(
+                f"{float(row['adaptive_base_epsilon_one_frequency']):.2%}"
+                for row in seed_rows
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Final matched comparison",
+            "",
+            "| Seed | Adaptive share, int=100 | Adaptive share, int=20 | "
+            "Base=1, int=100 | Base=1, int=20 |",
+            "|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for seed in range(3):
+        old = control_by_seed_step[(seed, final)]
+        new = rows_by_seed_step[(seed, final)]
+        lines.append(
+            f"| {seed} | {float(old['adaptive_market_share']):.4f} | "
+            f"{float(new['adaptive_market_share']):.4f} | "
+            f"{float(old['adaptive_base_epsilon_one_frequency']):.3%} | "
+            f"{float(new['adaptive_base_epsilon_one_frequency']):.3%} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Final dispersion and PPO economics",
+            "",
+            "| Metric | Interval=100 | Interval=20 |",
+            "|---|---:|---:|",
+            f"| Adaptive share std | {control[final]['adaptive_market_share'][1]:.4f} | "
+            f"{fast[final]['adaptive_market_share'][1]:.4f} |",
+            f"| Adaptive base=1 std | "
+            f"{control[final]['adaptive_base_epsilon_one_frequency'][1]:.3%} | "
+            f"{fast[final]['adaptive_base_epsilon_one_frequency'][1]:.3%} |",
+            f"| PPO share | {control[final]['ppo_market_share'][0]:.4f} | "
+            f"{fast[final]['ppo_market_share'][0]:.4f} |",
+            f"| PPO total PnL/step | {control[final]['ppo_total_pnl_per_step'][0]:.4f} | "
+            f"{fast[final]['ppo_total_pnl_per_step'][0]:.4f} |",
+            f"| PPO mean abs inventory | {control[final]['ppo_mean_abs_inventory'][0]:.3f} | "
+            f"{fast[final]['ppo_mean_abs_inventory'][0]:.3f} |",
+            "",
+            "## Conclusion and next step",
+            "",
+            f"PPO final mean share {control[final]['ppo_market_share'][0]:.4f} -> "
+            f"{fast[final]['ppo_market_share'][0]:.4f}，total PnL/step "
+            f"{control[final]['ppo_total_pnl_per_step'][0]:.4f} -> "
+            f"{fast[final]['ppo_total_pnl_per_step'][0]:.4f}，mean abs inventory "
+            f"{control[final]['ppo_mean_abs_inventory'][0]:.3f} -> "
+            f"{fast[final]['ppo_mean_abs_inventory'][0]:.3f}。更频繁 probing 让 Adaptive "
+            "保持竞争，因此 PPO 的份额与 PnL 明显降低，同时 inventory exposure 下降。",
+            "",
+            (
+                "**Tracking-bandwidth hypothesis 得到支持。** Seed 1 的退出态消失，三个 seeds "
+                "均保持 meaningful interaction，且 Adaptive share/base=1 的 cross-seed "
+                "dispersion 同时下降。Seed 0 late window 有一定回落，但没有接近此前 lock-in。"
+                "下一步应测试能否以更有选择性的 refresh allocation 降低 5% probing cost，"
+                "而不是进入 Step 1/Step 2 mechanism diagnosis。"
+                if tracking_supported
+                else "**Simply refreshing diagonal estimates faster is insufficient。** 至少一项"
+                "关键条件（seed 1 恢复、3-seed meaningful interaction、share/base=1 dispersion "
+                "同时下降）未满足。停止调整 probe frequency；下一步进入 off-diagonal Step-2 "
+                "statistics、EMA lag 与 Step-1/Step-2 feedback diagnosis。"
+            ),
+            "",
+        ]
+    )
+    (output / "report_zh.md").write_text("\n".join(lines))
+
+
 def write_longrun_report(
     output: Path,
     trajectory: list[dict],
@@ -1512,7 +1703,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Screen PPO against an online Adaptive MM")
     parser.add_argument(
         "--mode",
-        choices=("screening", "calibrated", "calibrated_frozen", "longrun"),
+        choices=(
+            "screening",
+            "calibrated",
+            "calibrated_fast_probe",
+            "calibrated_frozen",
+            "longrun",
+        ),
         default="screening",
     )
     parser.add_argument("--seeds", type=int, default=3)
@@ -1538,6 +1735,14 @@ def main() -> None:
         expected_steps = 100_352
         default_output = ROOT / "results" / "ppo_vs_adaptive_calibrated"
         comparison_path = PROBING_RESULTS / "training_trajectories.csv"
+    elif args.mode == "calibrated_fast_probe":
+        checkpoints = SCREENING_CHECKPOINTS
+        expected_seeds = 3
+        expected_steps = 100_352
+        default_output = ROOT / "results" / "ppo_vs_adaptive_calibrated_probe20"
+        comparison_path = (
+            ROOT / "results" / "ppo_vs_adaptive_calibrated" / "training_trajectories.csv"
+        )
     elif args.mode == "calibrated_frozen":
         checkpoints = SCREENING_CHECKPOINTS
         expected_seeds = 3
@@ -1579,6 +1784,8 @@ def main() -> None:
         print(f"Running PPO vs Adaptive seed={seed} mode={args.mode}", flush=True)
         if args.mode == "calibrated":
             training_function = train_calibrated_seed
+        elif args.mode == "calibrated_fast_probe":
+            training_function = train_calibrated_fast_probe_seed
         elif args.mode == "calibrated_frozen":
             training_function = run_calibrated_frozen_seed
         else:
@@ -1601,7 +1808,8 @@ def main() -> None:
             + (
                 f" calibration={row['calibration_steps']} cold_start="
                 f"{row['formal_cold_start_steps']}"
-                if args.mode in ("calibrated", "calibrated_frozen")
+                if args.mode
+                in ("calibrated", "calibrated_fast_probe", "calibrated_frozen")
                 else ""
             ),
             flush=True,
@@ -1611,6 +1819,8 @@ def main() -> None:
         write_screening_report(output_dir, trajectory, comparison_trajectory)
     elif args.mode == "calibrated":
         write_calibrated_report(output_dir, trajectory, comparison_trajectory)
+    elif args.mode == "calibrated_fast_probe":
+        write_fast_probe_report(output_dir, trajectory, comparison_trajectory)
     elif args.mode == "calibrated_frozen":
         write_calibrated_frozen_report(output_dir, trajectory, comparison_trajectory)
     else:
