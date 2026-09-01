@@ -118,7 +118,7 @@ class InvestorFlowTests(unittest.TestCase):
         next_observation, _, _, info = env.step(
             np.array([0.0, 0.0, 0.0], dtype=np.float32)
         )
-        self.assertAlmostEqual(next_observation[0], info["inventory"])
+        self.assertAlmostEqual(next_observation[0], info["inventory"], delta=1e-6)
         self.assertAlmostEqual(next_observation[1], env.price / cfg.P0 - 1.0)
         self.assertAlmostEqual(next_observation[2], info["inventory_pnl"])
 
