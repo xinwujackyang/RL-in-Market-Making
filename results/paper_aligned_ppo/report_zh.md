@@ -74,7 +74,7 @@ Current 组的 worst side error 是 seed 3 ask `0.5278`；paper-aligned 组仍�
 
 Paper-aligned PPO 的 bid accuracy 变差、ask accuracy 略好，两者抵消后整体 MAE 只下降 `0.00046`。Per-seed combined error 更均匀，但这不是 robust convergence：signed bid dispersion 从 `0.1794` 增至 `0.2062`，signed ask dispersion 从 `0.2862` 降至 `0.2341`，而 worst error 仍超过 0.5。
 
-![Current versus paper-aligned comparison](/Users/jackyang/Desktop/Courses_IUB/Research/RL/RLMM/results/paper_aligned_ppo/current_vs_paper_aligned.png)
+![Current versus paper-aligned comparison](current_vs_paper_aligned.png)
 
 ## Mean-policy training dynamics
 
@@ -94,7 +94,7 @@ Paper-aligned PPO 的 bid accuracy 变差、ask accuracy 略好，两者抵消�
 
 因此不能声称 paper-reported setting 使 actor mean trajectory 更平滑。由于 learning rate 两组相同，本轮也不能回答“更小 learning rate 是否更稳定”。
 
-![Mean policy training trajectories](/Users/jackyang/Desktop/Courses_IUB/Research/RL/RLMM/results/paper_aligned_ppo/mean_policy_training.png)
+![Mean policy training trajectories](mean_policy_training.png)
 
 ## Variance dynamics
 
@@ -107,7 +107,7 @@ Paper-aligned PPO 的 bid accuracy 变差、ask accuracy 略好，两者抵消�
 
 Latent sigma 的 paired mean change 只有 bid `-0.00005`、ask `-0.00195`，在 seed variation 下没有实际意义。Sampled epsilon std 也基本不变。这次不存在可被误认成 variance reduction 的大幅 tanh-saturation effect；policy concentration gap 保持原样。
 
-![Policy standard-deviation trajectories](/Users/jackyang/Desktop/Courses_IUB/Research/RL/RLMM/results/paper_aligned_ppo/policy_std_training.png)
+![Policy standard-deviation trajectories](policy_std_training.png)
 
 ## Clip 0.3 的 observed optimization behavior
 
@@ -142,4 +142,3 @@ Paper-aligned group 仍有：
 - 持续 offset、drift 与 oscillation 的 mean-policy trajectories。
 
 因此只对齐论文明确报告的 learning rate/clip，并未复现 mean near zero 且 policy 集中的结果。按停止条件，本轮未切换 RLlib、未改 reward、未做 entropy/state/hyperparameter sweep。
-

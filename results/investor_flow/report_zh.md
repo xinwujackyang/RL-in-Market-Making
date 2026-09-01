@@ -42,7 +42,7 @@ Ask sampled std 的平均值下降 `0.0388`，但这不是稳定的 variance 学
 
 训练轨迹也给出同一结论：20,480 steps 后两组 latent std 仍约为初始值 `1.0`，没有形成持续下降。
 
-![Latent std training trajectory](/Users/jackyang/Desktop/Courses_IUB/Research/RL/RLMM/results/investor_flow/latent_std_trajectory_flow_only.png)
+![Latent std training trajectory](latent_std_trajectory_flow_only.png)
 
 ## Analytical error 与 seed stability
 
@@ -89,9 +89,8 @@ Unit flow 完全符合 `N_buy ~ Binomial(20, 0.5)`：observed timestep std `2.22
 
 PnL 和 inventory 的下降主要反映 gross volume 约减半，不应被解释为 policy learning 的改善或恶化。核心结论仍应来自 pricing mean、sampled action std、latent std 和 across-seed analytical error。
 
-![Flow-only comparison](/Users/jackyang/Desktop/Courses_IUB/Research/RL/RLMM/results/investor_flow/comparison_flow_only.png)
+![Flow-only comparison](comparison_flow_only.png)
 
 ## 停止决定
 
 Flow-Only A/B 未满足“Paper Flow 明显改善”的触发条件，因此没有运行 `unit_current_ppo vs unit_paper_ppo`。本轮也没有进入 Persistent、entropy ablation、inventory sweep、Adaptive MM 或 reward redesign。
-

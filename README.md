@@ -1,24 +1,196 @@
-# RL Market Making: PPO Stability and State-Dependent Exploration
+# RL for Market Making
 
-A research implementation of reinforcement learning for market making in a simulated multi-dealer market, inspired by **Ganesh et al., “Reinforcement Learning for Market Making in a Multi-agent Dealer Market” (NeurIPS 2019)**.
+A multi-seed research project on how a PPO dealer learns quoting, inventory
+control, and hedging in a competitive simulated market. The project combines a
+correctness-audited PyTorch PPO implementation with fixed, adaptive, and classical
+stochastic-control benchmarks.
 
-This project began as a reproduction of the paper's PPO market maker. It evolved into a systematic investigation of a more basic question:
+This repository is a **controlled behavioral investigation inspired by Ganesh et
+al. (NeurIPS 2019)**, not an exact numerical reproduction of the paper.
 
-> **Why can an apparently correct PPO market-making policy learn reasonable quotes early in training, yet become unstable across seeds or drift over long horizons?**
+## Research question
 
-The implementation was first audited for market-event timing, inventory signs, PnL accounting, bounded-action likelihoods, GAE, and rollout bootstrapping. I then ran controlled multi-seed experiments on network architecture, observation scaling, policy variance, KL regularization, critic targets, value clipping, entropy regularization, bounded policy distributions, and PPO batch reuse.
+> **How does a PPO market maker learn quoting, inventory control, and hedging under
+> competitive dealer markets, and how does it compare with heuristic, adaptive,
+> and classical stochastic-control benchmarks?**
 
-The strongest result so far is that **state-dependent policy variance** substantially improves long-run mean-policy stability. Against a random competitor, it roughly halves deterministic quote error and reduces cross-seed dispersion by about two thirds. The improvement also generalizes to a persistent competitor, where the learned variance develops a clear inventory-dependent structure.
+The work separates four questions that should not be collapsed into one leaderboard:
 
-This repository is a **behavioral replication and RL investigation**, not an exact numerical reproduction of the original paper.
+| Research question | Matched comparison | Main result |
+|---|---|---|
+| Does PPO learn against a fixed dealer? | PPO vs Persistent | Learns nontrivial quoting and inventory-conditioned behavior |
+| Can PPO compete with an adaptive dealer? | PPO vs Adaptive | Eventually improves normalized margin and volume |
+| Does PPO rediscover classical inventory control? | PPO vs A-S | Yes in direction, not in exact form |
+| Does richer RL beat A-S economically? | PPO vs A-S | No; A-S wins 2/3 seed paths |
 
-The pure, environment-independent Adaptive Market Maker Phase 1 decision logic
-and its documented interpretation choices are described in
-[`docs/adaptive_market_maker.md`](docs/adaptive_market_maker.md).
+## Environment
+
+Two dealers compete for the same investor orders. At every 15-minute step the
+agent chooses:
+
+```text
+(epsilon_bid, epsilon_ask, hedge_fraction)
+```
+
+The simulator then applies hedge → investor routing → inventory update → GBM price
+move → inventory PnL. Smaller epsilon means a more aggressive quote. Accounting is
+
+```text
+TotalPnL = SpreadPnL + InventoryPnL - HedgeCost
+```
+
+Formal Adaptive/A-S benchmarks use 20 unit orders per step, balanced buy/sell
+directions, and `sigma=0.2`. Routing is **winner-take-all**: the best quote wins the
+entire order and an exact tie is split randomly.
+
+## Headline findings
+
+### 1. PPO learns economically meaningful market-making controls
+
+The learned quote can be decomposed into a symmetric level and an inventory skew:
+
+```text
+m = (epsilon_bid + epsilon_ask) / 2
+k = epsilon_bid - epsilon_ask
+```
+
+Against Adaptive, the final inventory-skew coefficient is positive in 3/3 seeds.
+PPO also learns absolute hedge control: final `E[h|q|]` rises monotonically across
+inventory-magnitude bins (`0.2816 → 1.5599 → 3.1131 → 4.6862`). The hedge fraction
+itself does not rise monotonically, so the supported conclusion is absolute
+balance-sheet reduction, not proportional inventory neutralization.
+
+### 2. PPO eventually improves the margin-volume trade-off against Adaptive
+
+At 100k steps PPO earns more normalized margin per captured unit but has lower
+volume. By 204.8k it reaches **54.16% market share** while retaining the normalized
+monetization advantage. The PPO/Adaptive normalized ratio evolves as
+
+```text
+1.1218 → 1.2001 → 1.3447
+```
+
+and PPO finishes with higher total PnL on 3/3 seed paths. This is an observed
+long-run regime, not a convergence claim: policy/economics still change at 204.8k
+and cross-seed PnL dispersion continues to expand.
+
+### 3. PPO independently rediscovers A-S-like inventory control
+
+The frozen normalized A-S controller has analytical pre-clip skew
+
+```text
+k_AS(q) = 0.1 q
+```
+
+while the final pooled PPO behavior is
+
+```text
+k_PPO(q) ≈ 0.1255 + 0.0476 q    (R² = 0.578)
+```
+
+In 96.0% of pooled states with `|q| >= 1`, PPO's skew has the same corrective
+direction as A-S. PPO rediscovers the **direction** of classical inventory control,
+but with weaker linear sensitivity and substantial nonlinear/state-dependent
+departures; it should not be described as “learning A-S.”
+
+### 4. The richer RL policy does not beat classical A-S
+
+At the final deterministic evaluation:
+
+| Metric | PPO | A-S | PPO − A-S |
+|---|---:|---:|---:|
+| Total PnL/step | 0.1340 ± 0.0796 | **0.2388 ± 0.1252** | -0.1048 |
+| Spread PnL/step | 0.1367 ± 0.0716 | **0.2322 ± 0.1289** | -0.0955 |
+| Inventory PnL/step | **0.0131 ± 0.0058** | 0.0066 ± 0.0271 | +0.0065 |
+| Hedge cost/step | 0.0158 ± 0.0040 | **0** | +0.0158 |
+
+PPO wins only 1/3 seed paths. The mean gap decomposes exactly as
+`-0.1048 = -0.0955 + 0.0065 - 0.0158`: lower spread capture plus nonzero hedge
+cost, rather than inventory losses, explains the negative result.
+
+## PPO vs A-S
+
+![PPO versus A-S inventory-conditioned quote skew](results/ppo_vs_as/inventory_skew_comparison.png)
+
+The figure compares the fixed analytical A-S line with deterministic PPO binned
+means. All three PPO seeds have positive skew slopes, but single-seed corrective
+direction ranges from 77.6% to 100%, so the pooled relationship should not hide
+policy heterogeneity.
+
+Reports: [`A-S standalone`](results/as_benchmark/report_zh.md) ·
+[`PPO vs A-S`](results/ppo_vs_as/report_zh.md)
+
+## PPO vs Adaptive
+
+![PPO versus Adaptive long-run economics](results/ppo_vs_adaptive_probe20_longrun/longrun_economics.png)
+
+| Step | PPO share | PPO normalized monetization | PPO/Adaptive ratio | PPO total PnL/step |
+|---:|---:|---:|---:|---:|
+| 100,352 | 0.4560 | 0.7450 | 1.1218 | 0.1111 |
+| 150,528 | 0.4674 | 0.9117 | 1.2001 | 0.2541 |
+| 204,800 | 0.5416 | 1.1460 | 1.3447 | 0.4784 |
+
+The final PPO PnL advantage is a spread/margin-volume result, not better inventory
+PnL or lower hedging cost. Its large final population std (`0.3906`) and continued
+movement are material limitations. Because the saved Adaptive artifact lacks
+dealer-volume-weighted reference-spread exposure, normalized monetization here is
+`(window spread PnL / captured volume) / window mean S_ref(1)`, as documented in
+the linked report.
+
+Reports: [`long-run economics`](results/ppo_vs_adaptive_probe20_longrun/report_zh.md) ·
+[`normalized spread`](results/ppo_vs_adaptive_normalized_spread/report_zh.md)
+
+## Benchmark taxonomy
+
+| Method | Type | Learning mechanism | Inventory control | External hedge |
+|---|---|---|---|---|
+| Persistent | heuristic | No | none | No |
+| Adaptive | empirical online learning | response table | quote skew | Yes |
+| A-S | stochastic control | No | analytical skew | No |
+| PPO | model-free RL | neural policy | learned skew | Yes |
+
+## Reproduce key experiments
+
+```bash
+python -m unittest discover -s tests -v
+python experiments/as_sanity.py
+python experiments/as_vs_persistent.py
+python experiments/ppo_vs_as.py
+python experiments/analyze_ppo_vs_as.py
+python experiments/analyze_ppo_vs_adaptive_pnl.py --longrun
+```
+
+The last three training/evaluation commands are expensive. Existing committed
+artifacts are the frozen project results; rerun them only when intentionally
+reproducing the research protocols.
+
+## Limitations
+
+- **Winner-take-all execution:** best quote wins the entire investor order; there
+  are no probabilistic partial fills, queue position, or continuous LOB dynamics.
+- **A-S compatibility model:** this is a normalized stationary implementation with
+  a one-day receding horizon, fixed `rho/kappa`, `inventory_anchor=20`, native
+  simulator execution, and no external hedge—not a direct calibration of the
+  original exponential Poisson-arrival model.
+- **Adaptive probing:** persistent diagonal probing is a project-specific mechanism
+  introduced to maintain response-map tracking under a learning opponent; it is not
+  presented as the paper's canonical algorithm.
+- **No convergence claim:** Adaptive long-run economics have not plateaued at
+  204.8k steps, and cross-seed dispersion is still widening.
+- **Protocol scope:** comparisons use synthetic GBM prices, limited observations,
+  one competitor at a time, and different matched protocols. Persistent, Adaptive,
+  A-S, and PPO PnL values must not be interpreted as one global leaderboard.
+
+Full Chinese synthesis: [`results/final_summary/report_zh.md`](results/final_summary/report_zh.md)
 
 ---
 
-## Key findings
+## Detailed experiment log
+
+The project began as a paper-inspired PPO reproduction and evolved through simulator
+correctness, representation, exploration, adaptive competition, policy
+interpretation, realized economics, and a classical stochastic-control benchmark.
+The sections below preserve that experimental record.
 
 ### 1. Correct PPO semantics matter
 
@@ -668,8 +840,8 @@ distinct controllers:
 
 This closes the main benchmark arc: simulator/RL correctness, adaptive competition,
 policy interpretation, realized PnL economics, and a classical stochastic-control
-reference. Remaining work is primarily presentation and synthesis rather than adding
-competitors.
+reference. The benchmark scope is now frozen; further engineering should begin only
+from a concrete new research question.
 
 ---
 
@@ -707,10 +879,12 @@ competitors.
 │   ├── inventory_variance_analysis/
 │   ├── as_benchmark/
 │   ├── ppo_vs_as/
+│   ├── final_summary/
 │   ├── rllib_reference/
 │   └── ...
 │
 ├── docs/
+│   ├── adaptive_market_maker.md
 │   ├── correctness_audit.md
 │   └── replication_findings.md
 │
@@ -761,9 +935,10 @@ Confirmed findings:
 ✓ PPO-vs-A-S policy and PnL comparison
 ```
 
-Project synthesis:
+Project freeze:
 
 ```text
-→ consolidate final README figures
-→ polish final report and project narrative
+✓ final research synthesis complete
+✓ headline benchmark scope frozen
+No more benchmark engineering without a concrete research question.
 ```

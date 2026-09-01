@@ -1,6 +1,6 @@
 # Adaptive Market Maker: Decision Logic and Online Response Table
 
-This module is a paper-faithful but documented interpretation of Ganesh et al.
+This module is a paper-inspired, explicitly documented interpretation of Ganesh et al.
 (NeurIPS 2019). It implements deterministic decisions, online response updates,
 a deterministic cold-start quote sequence, and minimal persistent probing.
 
