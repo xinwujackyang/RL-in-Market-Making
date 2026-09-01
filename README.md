@@ -117,18 +117,20 @@ means. All three PPO seeds have positive skew slopes, but single-seed corrective
 direction ranges from 77.6% to 100%, so the pooled relationship should not hide
 policy heterogeneity.
 
-Reports: [`A-S standalone`](results/as_benchmark/report_zh.md) ·
-[`PPO vs A-S`](results/ppo_vs_as/report_zh.md)
+Reports: [`A-S standalone`](results/as_benchmark/report.md)
+([中文](results/as_benchmark/report_zh.md)) ·
+[`PPO vs A-S`](results/ppo_vs_as/report.md)
+([中文](results/ppo_vs_as/report_zh.md))
 
 ## PPO vs Adaptive
 
 ![PPO versus Adaptive long-run economics](results/ppo_vs_adaptive_probe20_longrun/longrun_economics.png)
 
-| Step | PPO share | PPO normalized monetization | PPO/Adaptive ratio | PPO total PnL/step |
-|---:|---:|---:|---:|---:|
-| 100,352 | 0.4560 | 0.7450 | 1.1218 | 0.1111 |
-| 150,528 | 0.4674 | 0.9117 | 1.2001 | 0.2541 |
-| 204,800 | 0.5416 | 1.1460 | 1.3447 | 0.4784 |
+| Step | PPO share | PPO normalized | Adaptive normalized | PPO/Adaptive ratio | PPO total PnL/step |
+|---:|---:|---:|---:|---:|---:|
+| 100,352 | 0.4560 | 0.7450 | 0.6642 | 1.1218 | 0.1111 |
+| 150,528 | 0.4674 | 0.9117 | 0.7597 | 1.2001 | 0.2541 |
+| 204,800 | 0.5416 | 1.1460 | 0.8523 | 1.3447 | 0.4784 |
 
 The final PPO PnL advantage is a spread/margin-volume result, not better inventory
 PnL or lower hedging cost. Its large final population std (`0.3906`) and continued
@@ -137,8 +139,9 @@ dealer-volume-weighted reference-spread exposure, normalized monetization here i
 `(window spread PnL / captured volume) / window mean S_ref(1)`, as documented in
 the linked report.
 
-Reports: [`long-run economics`](results/ppo_vs_adaptive_probe20_longrun/report_zh.md) ·
-[`normalized spread`](results/ppo_vs_adaptive_normalized_spread/report_zh.md)
+Report: [`PPO vs Adaptive`](results/ppo_vs_adaptive_probe20_longrun/report.md)
+([中文](results/ppo_vs_adaptive_probe20_longrun/report_zh.md)) ·
+[normalization research record](results/ppo_vs_adaptive_normalized_spread/report_zh.md)
 
 ## Benchmark taxonomy
 
@@ -181,7 +184,8 @@ reproducing the research protocols.
   one competitor at a time, and different matched protocols. Persistent, Adaptive,
   A-S, and PPO PnL values must not be interpreted as one global leaderboard.
 
-Full Chinese synthesis: [`results/final_summary/report_zh.md`](results/final_summary/report_zh.md)
+Full synthesis: [`English`](results/final_summary/report.md) ·
+[`中文`](results/final_summary/report_zh.md)
 
 ---
 
@@ -191,6 +195,10 @@ The project began as a paper-inspired PPO reproduction and evolved through simul
 correctness, representation, exploration, adaptive competition, policy
 interpretation, realized economics, and a classical stochastic-control benchmark.
 The sections below preserve that experimental record.
+
+Historical experiment reports are retained as research records and are primarily
+written in Chinese. The final synthesis and major benchmark reports are available in
+English.
 
 ### 1. Correct PPO semantics matter
 
@@ -365,8 +373,10 @@ as a tuned claim that either controller universally dominates.
 
 Reports:
 
-- [`results/as_benchmark/report_zh.md`](results/as_benchmark/report_zh.md)
-- [`results/ppo_vs_as/report_zh.md`](results/ppo_vs_as/report_zh.md)
+- [`A-S benchmark`](results/as_benchmark/report.md) ·
+  [`中文`](results/as_benchmark/report_zh.md)
+- [`PPO vs A-S`](results/ppo_vs_as/report.md) ·
+  [`中文`](results/ppo_vs_as/report_zh.md)
 
 ---
 
@@ -753,10 +763,13 @@ The `results/` directory is intentionally kept as an experimental record.
 | Does a Beta policy improve bounded-action learning? | [`results/beta_policy_screen/report_zh.md`](results/beta_policy_screen/report_zh.md) |
 | Do fewer epochs or zero entropy improve PPO? | [`results/ppo_mechanism_screen/report_zh.md`](results/ppo_mechanism_screen/report_zh.md) |
 | Does the three-epoch result survive long training? | [`results/epochs_3_confirmation/report_zh.md`](results/epochs_3_confirmation/report_zh.md) |
-| Does normalized A-S control inventory under native routing? | [`results/as_benchmark/report_zh.md`](results/as_benchmark/report_zh.md) |
-| Does PPO learn A-S-like inventory control, and how do their economics differ? | [`results/ppo_vs_as/report_zh.md`](results/ppo_vs_as/report_zh.md) |
+| Can PPO improve margin and volume against a tracked Adaptive dealer? | [`English`](results/ppo_vs_adaptive_probe20_longrun/report.md) · [`中文`](results/ppo_vs_adaptive_probe20_longrun/report_zh.md) |
+| Does normalized A-S control inventory under native routing? | [`English`](results/as_benchmark/report.md) · [`中文`](results/as_benchmark/report_zh.md) |
+| Does PPO learn A-S-like inventory control, and how do their economics differ? | [`English`](results/ppo_vs_as/report.md) · [`中文`](results/ppo_vs_as/report_zh.md) |
 
-Detailed reports are currently written in Chinese; code, configuration names, metrics, and experiment outputs use English identifiers.
+Historical reports are primarily written in Chinese; canonical English reports cover
+the final synthesis and major Adaptive/A-S benchmarks. Code, configuration names,
+metrics, and experiment outputs use English identifiers.
 
 ---
 
