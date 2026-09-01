@@ -155,6 +155,49 @@ Detailed report: [`results/persistent_state_dependent_std/report_zh.md`](results
 
 ---
 
+### 5. PPO learns A-S-like inventory skew, but not the same control law
+
+The project now includes a **normalized stationary Avellaneda–Stoikov benchmark**.
+It preserves the canonical reservation-price and optimal-spread structure, uses a
+fixed one-trading-day risk horizon, normalizes dollar parameters by the simulator's
+unit-flow reference spread, and leaves routing and PnL accounting entirely to the
+native winner-take-all environment.
+
+In a standalone 3-seed, 100,352-step validation, A-S produced strong inventory
+mean reversion with zero quote clipping:
+
+| Metric | A-S | Persistent |
+|---|---:|---:|
+| Market share | 0.4998 | 0.5002 |
+| Mean absolute inventory | **4.998** | 1131.933 |
+| Inventory std | **5.912** | 621.310 |
+| Normalized spread monetization | 0.7499 | **1.0000** |
+
+PPO was then trained from scratch against the frozen A-S dealer for 204,800 steps
+in each of three seeds. On deterministic final evaluations, PPO learned the correct
+inventory-control direction in 96.0% of states with `|q| >= 1`, but its pooled skew
+was weaker and nonlinear:
+
+```text
+A-S:  k(q) = 0.1 q                  before clipping
+PPO:  k(q) = 0.1255 + 0.0476 q     pooled linear fit, R² = 0.578
+```
+
+![PPO versus A-S inventory-conditioned quote skew](results/ppo_vs_as/inventory_skew_comparison.png)
+
+At the final checkpoint PPO total PnL/step was `0.1340 ± 0.0796`, versus
+`0.2388 ± 0.1252` for A-S, with PPO winning one of three seed paths. The mean gap
+was primarily lower spread PnL plus nonzero hedge cost, not adverse inventory PnL.
+The result is deliberately reported as a heterogeneous multi-seed comparison, not
+as a tuned claim that either controller universally dominates.
+
+Reports:
+
+- [`results/as_benchmark/report_zh.md`](results/as_benchmark/report_zh.md)
+- [`results/ppo_vs_as/report_zh.md`](results/ppo_vs_as/report_zh.md)
+
+---
+
 ## Inventory-conditioned exploration
 
 ![Inventory-conditioned exploration](figures/inventory_conditioned_exploration.png)
@@ -381,7 +424,7 @@ The following is the **current research reference**, not a claim of globally opt
 | Value clipping | none |
 | Explicit KL penalty | none |
 | Long-run budget | `204,800` environment steps |
-| Main competitors | Random, Persistent |
+| Main competitors | Random, Persistent, Adaptive, normalized stationary A-S |
 
 Experiments set these values explicitly so that historical runs remain reproducible even where the global `Config` defaults differ.
 
@@ -413,6 +456,13 @@ two_side_MAE =
 rather than treating raw episodic PnL as the primary learning metric.
 
 The Persistent competitor instead quotes fixed `epsilon = 0.5`. Because the learned policy remains stochastic and routing is winner-take-all, its optimal stochastic response is not simply the deterministic `0.5-` benchmark.
+
+The A-S competitor is different from the one-step Random benchmark. It implements
+an analytical inventory-aware stochastic-control quote with a fixed receding risk
+horizon. Its normalized parameters are anchored so that `q=0` reproduces the unit
+reference quote and `q=20` shifts the quote by one full reference distance. No
+smooth execution elasticity is estimated from winner-take-all routing, and the A-S
+hedge action is fixed at zero.
 
 See [`experiments/analytical_response.py`](experiments/analytical_response.py).
 
@@ -501,6 +551,16 @@ python experiments/epochs_3_confirmation.py
 python experiments/rllib_reference.py
 ```
 
+### Adaptive and Avellaneda–Stoikov benchmarks
+
+```bash
+python experiments/adaptive_mm_validation.py
+python experiments/as_sanity.py
+python experiments/as_vs_persistent.py
+python experiments/ppo_vs_as.py
+python experiments/analyze_ppo_vs_as.py
+```
+
 Many long-run experiments use five independent seeds and 204,800 training steps per seed and are therefore significantly more expensive than the default smoke runs.
 
 ---
@@ -521,6 +581,8 @@ The `results/` directory is intentionally kept as an experimental record.
 | Does a Beta policy improve bounded-action learning? | [`results/beta_policy_screen/report_zh.md`](results/beta_policy_screen/report_zh.md) |
 | Do fewer epochs or zero entropy improve PPO? | [`results/ppo_mechanism_screen/report_zh.md`](results/ppo_mechanism_screen/report_zh.md) |
 | Does the three-epoch result survive long training? | [`results/epochs_3_confirmation/report_zh.md`](results/epochs_3_confirmation/report_zh.md) |
+| Does normalized A-S control inventory under native routing? | [`results/as_benchmark/report_zh.md`](results/as_benchmark/report_zh.md) |
+| Does PPO learn A-S-like inventory control, and how do their economics differ? | [`results/ppo_vs_as/report_zh.md`](results/ppo_vs_as/report_zh.md) |
 
 Detailed reports are currently written in Chinese; code, configuration names, metrics, and experiment outputs use English identifiers.
 
@@ -554,7 +616,7 @@ Important differences include:
 - market parameters inherited from this project rather than exact paper calibration;
 - custom PyTorch PPO rather than historical RLlib PPO;
 - one competing dealer at a time;
-- the Adaptive Market Maker is not yet implemented.
+- the Adaptive and normalized A-S competitors are project-specific compatibility implementations rather than exact paper calibrations.
 
 Results should therefore be interpreted as **controlled behavioral experiments**, not exact paper replication numbers.
 
@@ -592,27 +654,22 @@ rather than selecting configurations from a single training curve.
 
 ---
 
-## Next: Adaptive Market Maker
+## Benchmark taxonomy
 
-The next extension is the paper's **Adaptive Market Maker**, which turns the environment from competition against a stationary opponent into a genuinely non-stationary multi-agent problem.
+The project headline comparison is now intentionally limited to four economically
+distinct controllers:
 
-The planned first implementation will focus on the canonical paper-style configuration:
+| Method | Type | Learns? | Inventory control | External hedge |
+|---|---|---|---|---|
+| Persistent | heuristic | No | None | No |
+| Adaptive | online empirical | Yes, response table | quote + hedge optimization | Yes |
+| A-S | stochastic control | No | analytical quote skew | No |
+| PPO | model-free RL | Yes | learned quote skew | Yes |
 
-```text
-target market share = 0.50
-risk aversion gamma = 2
-response-table forgetting beta = 0.35
-```
-
-The Adaptive dealer will maintain online estimates of quote response, choose a base spread to target market share, skew quotes to manage inventory, and choose a hedge fraction from a risk/cost tradeoff.
-
-Before training PPO against it, the implementation will be validated independently for:
-
-1. market-share targeting;
-2. economically signed inventory skew;
-3. risk-sensitive hedging behavior.
-
-This will test whether the current PPO policy remains effective when its competitor itself adapts to the RL dealer.
+This closes the main benchmark arc: simulator/RL correctness, adaptive competition,
+policy interpretation, realized PnL economics, and a classical stochastic-control
+reference. Remaining work is primarily presentation and synthesis rather than adding
+competitors.
 
 ---
 
@@ -622,6 +679,7 @@ This will test whether the current PPO policy remains effective when its competi
 .
 ├── src/
 │   ├── config.py
+│   ├── avellaneda_stoikov.py
 │   ├── environments.py
 │   ├── evaluation.py
 │   ├── market.py
@@ -636,6 +694,9 @@ This will test whether the current PPO policy remains effective when its competi
 │   ├── state_dependent_std.py
 │   ├── persistent_state_dependent_std.py
 │   ├── inventory_variance_analysis.py
+│   ├── as_vs_persistent.py
+│   ├── ppo_vs_as.py
+│   ├── analyze_ppo_vs_as.py
 │   ├── rllib_reference.py
 │   └── ...
 │
@@ -644,6 +705,8 @@ This will test whether the current PPO policy remains effective when its competi
 │   ├── state_dependent_std/
 │   ├── persistent_state_dependent_std/
 │   ├── inventory_variance_analysis/
+│   ├── as_benchmark/
+│   ├── ppo_vs_as/
 │   ├── rllib_reference/
 │   └── ...
 │
@@ -693,12 +756,14 @@ Confirmed findings:
 ✓ inventory-conditioned variance mechanism
 ✓ bounded Beta-policy screening
 ✓ entropy and batch-reuse ablations
+✓ Adaptive Market Maker validation and PPO competition
+✓ normalized stationary Avellaneda–Stoikov benchmark
+✓ PPO-vs-A-S policy and PnL comparison
 ```
 
-Next milestone:
+Project synthesis:
 
 ```text
-→ Adaptive Market Maker
-→ PPO vs adaptive opponent
-→ non-stationary multi-agent market making
+→ consolidate final README figures
+→ polish final report and project narrative
 ```

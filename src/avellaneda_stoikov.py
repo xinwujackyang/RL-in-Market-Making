@@ -110,6 +110,12 @@ class AvellanedaStoikovMarketMaker:
         self.bid_clip_count = 0
         self.ask_clip_count = 0
         self.last_quote: AvellanedaStoikovQuote | None = None
+        # The environment's market-state hook exposes these diagnostic fields
+        # for its original Adaptive MM user.  They remain false/non-probing for
+        # A-S; ``last_base_epsilon`` is the current symmetric raw quote level.
+        self.last_base_epsilon = self.neutral_epsilon
+        self.last_action_was_cold_start = False
+        self.last_action_was_probe = False
 
     def price_variance(self, price: float) -> float:
         """Local GBM/Brownian variance over the fixed receding risk horizon."""
@@ -198,6 +204,7 @@ class AvellanedaStoikovMarketMaker:
         self.bid_clip_count += int(bid_clipped)
         self.ask_clip_count += int(ask_clipped)
         self.last_quote = decision
+        self.last_base_epsilon = float((raw_bid + raw_ask) / 2.0)
         return decision
 
     def act_with_market_state(
